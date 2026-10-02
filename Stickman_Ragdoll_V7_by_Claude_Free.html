@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ragdoll Stickman - V7 (Battle Motion)</title>
+<style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#0f172a; color:#f8fafc;
+        font-family: system-ui, sans-serif; user-select:none; }
+    #gameCanvas { display:block; background:linear-gradient(#1e293b,#0f172a); }
+    #ui { position:absolute; top:12px; left:12px; font-size:13px; color:#94a3b8; line-height:1.6;
+        transform:scale(0.7); transform-origin:top left; }  /* UI diperkecil 30% */
+    #ui #state { white-space:pre-line; }
+    #ui h1 { margin:0 0 4px; font-size:18px; color:#38bdf8; }
+    #ui .row { display:flex; align-items:center; gap:8px; }
+    #ui label { width:130px; color:#e2e8f0; }
+    #ui input[type=range] { width:140px; }
+    #ui b { color:#38bdf8; }
+    #ui .p2 { color:#fb923c; }
+    #ui .btns { margin-top:6px; display:flex; flex-wrap:wrap; gap:6px; max-width:420px; }
+    #ui button { background:#1e293b; color:#e2e8f0; border:1px solid #475569; border-radius:6px;
+        padding:4px 10px; cursor:pointer; font-size:12px; }
+    #ui button:hover { background:#334155; }
+    #ui button.active { background:#0369a1; border-color:#38bdf8; }
+</style>
+</head>
+<body>
+<div id="ui">
+    <h1>Ragdoll Stickman V7</h1>
+    <div><b>P1</b>: ← → Jalan, ↑ Lompat, ↓ Pukul &nbsp;|&nbsp; <b class="p2">P2</b>: A D Jalan, W Lompat, S Pukul &nbsp;|&nbsp; <b>R</b> Reset</div>
+    <div class="row"><label>RAGDOLL_STRENGTH</label><input id="sStrength" type="range" min="0" max="1" step="0.05"><span id="vStrength"></span></div>
+    <div class="row"><label>jumpPower</label><input id="sJump" type="range" min="4" max="24" step="0.5"><span id="vJump"></span></div>
+    <div class="row"><label>GRAVITY</label><input id="sGrav" type="range" min="0.2" max="1.2" step="0.05"><span id="vGrav"></span></div>
+    <div class="row"><label>walkingSpeed</label><input id="sWalk" type="range" min="1" max="8" step="0.1"><span id="vWalk"></span></div>
+    <div class="row"><label>motionValue</label><input id="sMV" type="range" min="0" max="3" step="0.1"><span id="vMV"></span></div>
+    <div class="row"><label>motionDefense</label><input id="sMD" type="range" min="0" max="10" step="1"><span id="vMD"></span></div>
+    <div class="row"><label>Lebar platform baru</label><input id="sPlatW" type="range" min="60" max="400" step="10"><span id="vPlatW"></span></div>
+    <div class="btns">
+        <button id="btnAdd">➕ Tambah Platform (klik di layar)</button>
+        <button id="btnUndo">↩ Hapus Terakhir</button>
+        <button id="btnClear">🗑 Hapus Semua</button>
+        <button id="btnDefault">⟲ 3 Platform Default</button>
+    </div>
+    <div id="hint">Klik kanan platform = hapus platform itu</div>
+    <div id="state"></div>
+</div>
+<canvas id="gameCanvas"></canvas>
+
+<script>
+// ==========================================================
+//  VARIABEL TUMPUAN  (berlaku UNIVERSAL untuk semua karakter)
+// ==========================================================
+let RAGDOLL_STRENGTH = 0.8;   // 0.0 = paling letoy, 1.0 = paling tegap
+let jumpPower   = 9;          // kecepatan awal lompat (px/frame)
+let GRAVITY     = 1.2;        // gravitasi, selalu lurus ke bawah (px/frame^2)
+let walkingSpeed = 2.6;       // kecepatan jalan (px/frame)
+let motionValue   = 0.5;      // kekuatan efek hit dari pukulan (0 = tidak ada dorongan, makin besar makin jauh terlempar)
+let motionDefense = 3;        // jumlah hit yang bisa ditahan sebelum terlempar (hit ke-(N+1) melempar korban)
+
+// Batas bawah kekuatan: di strength 0 pun karakter tetap bisa berdiri
+const MIN_STAND_STRENGTH = 0.25;
+
+// false = harus tekan ulang tombol lompat tiap lompatan (tahan tombol tidak bikin lompat beruntun)
+const ALLOW_HOLD_JUMP = false;
+
+// Pengaman fisika: kecepatan maksimum tiap titik (px/frame)
+const MAX_SPEED = 30;
+
+// Platform otomatis: jarak antar tingkat = rasio x perkiraan tinggi lompat (<= 1.0 agar bisa dinaiki)
+const PLATFORM_STEP_RATIO = 0.7;
+
+// Battle motion
+const PUNCH_FRAMES = 14;     // durasi satu pukulan
+const FIST_R = 7;            // radius kepalan untuk deteksi hit
+const HIT_PUSH = 8;          // dorongan kecil saat hit ditahan (x motionValue)
+const LAUNCH_X = 20, LAUNCH_Y = 22;   // kecepatan lempar saat pertahanan jebol (x motionValue)
+const THROWN_MIN = 25, THROWN_MAX = 150;  // lama minimum / maksimum status terlempar (frame)
+const INVULN_AFTER = 30;     // kebal sebentar setelah bangun (frame)
+const GETUP_MAX = 6;         // kecepatan naik pinggul maksimum saat bangun (px/frame)
+
+const FLOOR_HEIGHT = 60;
+const AIR_DRAG = 0.995;
+
+// Ukuran tubuh
+const HEAD_R = 12, FOOT_R = 4, JOINT_R = 4;
+const HEAD_DIST = 22, TORSO = 42;
+const UPPER_LEG = 28, LOWER_LEG = 28, LEG_LEN = UPPER_LEG + LOWER_LEG;
+const UPPER_ARM = 20, LOWER_ARM = 20;
+const STANCE = 9;
+const STRIDE = 16, STEP_HEIGHT = 9;    // panjang langkah dasar (ikut membesar bila walkingSpeed naik)
+
+// ==========================================================
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let width, height, groundY;
+let platforms = [];
+let jumpHeightEst = 0, platformStep = 0;
+let effects = [];
+let platformWidth = 150;
+let placing = false;
+const mouse = { x: 0, y: 0, inside: false };
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// ---------- Fisika dasar (Verlet) ----------
+class Point {
+    constructor(x, y, r) {
+        this.x = this.oldX = x; this.y = this.oldY = y; this.prevY = y;
+        this.r = r; this.pinX = false; this.pinY = false; this.isFoot = false;  // pin: tidak digeser oleh tulang
+    }
+    update(g) {
+        this.prevY = this.y;
+        const vx = clamp((this.x - this.oldX) * AIR_DRAG, -MAX_SPEED, MAX_SPEED);
+        const vy = clamp((this.y - this.oldY) * AIR_DRAG, -MAX_SPEED, MAX_SPEED);
+        this.oldX = this.x; this.oldY = this.y;
+        this.x += vx;
+        this.y += vy + g;                 // gravitasi hanya ke bawah
+    }
+    land(surfaceY) {                      // bertumpu di atas lantai / platform
+        this.y = surfaceY - this.r;
+        const vx = (this.x - this.oldX) * 0.6;
+        this.oldY = this.y + (this.y - this.oldY) * 0.05;
+        this.oldX = this.x - vx;
+    }
+    bounds() {
+        if (this.y > groundY - this.r) this.land(groundY);
+        if (this.x > width - this.r)  { this.x = width - this.r;  this.oldX = this.x; }
+        if (this.x < this.r)          { this.x = this.r;          this.oldX = this.x; }
+    }
+}
+
+class Bone {
+    constructor(a, b, len) { this.a = a; this.b = b; this.len = len; }
+    resolve() {
+        const a = this.a, b = this.b;
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.hypot(dx, dy) || 0.0001;
+        const f = (this.len - d) / d;
+        const ax = a.pinX ? 0 : 1, bx = b.pinX ? 0 : 1, sx = ax + bx;
+        const ay = a.pinY ? 0 : 1, by = b.pinY ? 0 : 1, sy = ay + by;
+        if (sx > 0) { a.x -= dx * f * ax / sx; b.x += dx * f * bx / sx; }
+        if (sy > 0) { a.y -= dy * f * ay / sy; b.y += dy * f * by / sy; }
+    }
+}
+
+// Platform "one-way": bisa ditembus dari bawah/samping, menopang dari atas
+class Platform {
+    constructor(x, y, w, h, auto = false) { this.x = x; this.y = y; this.w = w; this.h = h; this.auto = auto; }
+    collide(p) {
+        if (p.x < this.x || p.x > this.x + this.w) return;
+        const prevBottom = p.prevY + p.r, bottom = p.y + p.r;
+        if (prevBottom <= this.y + 2 && bottom > this.y) p.land(this.y);
+    }
+}
+
+function surfaceFor(x, bottom) {
+    let best = groundY;
+    for (const pl of platforms)
+        if (x >= pl.x && x <= pl.x + pl.w && pl.y >= bottom - 6 && pl.y < best) best = pl.y;
+    return best;
+}
+
+// Tarik titik ke target. damp = bagian gerakan yang tidak jadi kecepatan (meredam getaran)
+function pull(p, tx, ty, k, damp) {
+    const dx = (tx - p.x) * k, dy = (ty - p.y) * k;
+    p.x += dx; p.y += dy;
+    p.oldX += dx * damp; p.oldY += dy * damp;
+}
+
+// ==========================================================
+//  RAGDOLL (satu instance = satu karakter)
+// ==========================================================
+class Ragdoll {
+    constructor(name, color, jointColor, binds) {
+        this.name = name; this.color = color; this.jointColor = jointColor;
+        this.binds = binds;                                  // {left, right, jump} = kode tombol
+        this.input = { left: false, right: false, jump: false, punch: false };
+        // Modifier tambahan per karakter (untuk item / efek lompat di masa depan).
+        // Nilai efektif = variabel global + mod. Default 0 => ikut global sepenuhnya.
+        this.mod = { ragdollStrength: 0, jumpPower: 0, gravity: 0, walkingSpeed: 0, motionValue: 0, motionDefense: 0 };
+    }
+
+    // Nilai efektif karakter ini (universal + mod miliknya), mis. P1.motionValue, P2.motionDefense
+    get motionValue()   { return this.stat('motionValue'); }
+    get motionDefense() { return this.stat('motionDefense'); }
+    maxDefense() { return Math.max(0, Math.round(this.motionDefense)); }
+
+    stat(name) {
+        const base = { ragdollStrength: RAGDOLL_STRENGTH, jumpPower, gravity: GRAVITY, walkingSpeed, motionValue, motionDefense }[name];
+        return base + (this.mod[name] || 0);
+    }
+
+    build(cx) {
+        this.points = []; this.bones = [];
+        const P = (x, y, r) => { const p = new Point(x, y, r); this.points.push(p); return p; };
+        const B = (a, b, l) => this.bones.push(new Bone(a, b, l));
+        const py = groundY - FOOT_R - LEG_LEN * 0.95;
+        const j = this.j = {};
+        j.pelvis = P(cx, py, JOINT_R);
+        j.neck   = P(cx, py - TORSO, JOINT_R);
+        j.head   = P(cx, py - TORSO - HEAD_DIST, HEAD_R);
+        j.elbowL = P(cx - 7, j.neck.y + UPPER_ARM, JOINT_R);
+        j.handL  = P(cx - 9, j.neck.y + UPPER_ARM + LOWER_ARM, JOINT_R);
+        j.elbowR = P(cx + 7, j.neck.y + UPPER_ARM, JOINT_R);
+        j.handR  = P(cx + 9, j.neck.y + UPPER_ARM + LOWER_ARM, JOINT_R);
+        j.kneeL  = P(cx - 5, py + UPPER_LEG, JOINT_R);
+        j.footL  = P(cx - STANCE, groundY - FOOT_R, FOOT_R);
+        j.kneeR  = P(cx + 5, py + UPPER_LEG, JOINT_R);
+        j.footR  = P(cx + STANCE, groundY - FOOT_R, FOOT_R);
+        B(j.neck, j.head, HEAD_DIST);
+        B(j.pelvis, j.neck, TORSO);
+        B(j.neck, j.elbowL, UPPER_ARM);   B(j.elbowL, j.handL, LOWER_ARM);
+        B(j.neck, j.elbowR, UPPER_ARM);   B(j.elbowR, j.handR, LOWER_ARM);
+        B(j.pelvis, j.kneeL, UPPER_LEG);  B(j.kneeL, j.footL, LOWER_LEG);
+        B(j.pelvis, j.kneeR, UPPER_LEG);  B(j.kneeR, j.footR, LOWER_LEG);
+        j.footL.isFoot = true; j.footR.isFoot = true;     // hanya ujung kaki yang berinteraksi dengan platform
+        this.setRootPinned(true);
+        this.state = 'normal'; this.thrownT = 0; this.invuln = 0; this.hitFlash = 0;
+        this.punchT = 0; this.punchCd = 0; this.prevPunch = false; this.punchHit = false;
+        this.defenseCurrent = this.lastMaxDef = this.maxDefense();
+        this.facing = 1; this.stepPhase = 0; this.jumpCooldown = 0;
+        this.jumpBuf = 0; this.prevJump = false; this.supported = false;
+    }
+
+    // Pinggul = "akar" yang menjaga karakter berdiri. Tulang tidak boleh mendorongnya,
+    // sehingga tarikan otot virtual tidak bisa menciptakan gaya dari nol.
+    // Nanti untuk fungsi jatuh: panggil setRootPinned(false) agar pinggul ikut jadi ragdoll penuh.
+    setRootPinned(v) { this.j.pelvis.pinX = v; this.j.pelvis.pinY = v; }
+
+    controller() {
+        const { pelvis, neck, head, elbowL, handL, elbowR, handR, kneeL, footL, kneeR, footR } = this.j;
+        const strength = clamp(this.stat('ragdollStrength'), 0, 1);
+        const speed = this.stat('walkingSpeed'), jp = this.stat('jumpPower');
+        const s = MIN_STAND_STRENGTH + (1 - MIN_STAND_STRENGTH) * strength;
+
+        const kTorso = 0.05 + 0.30 * s, kHead = 0.04 + 0.25 * s, kArm = 0.02 + 0.18 * s;
+        const kKnee = 0.20 + 0.20 * s, kFoot = 0.35 + 0.15 * s, supportK = 0.25 + 0.25 * s;
+        const heightRatio = 0.80 + 0.17 * s;      // letoy = lutut lebih menekuk
+        const slouch = (1 - s) * 8;               // letoy = badan sedikit membungkuk
+        const stride = clamp(STRIDE * speed / 2.6, 10, 34);
+
+        const inp = this.input;
+        if (this.jumpCooldown > 0) this.jumpCooldown--;
+        if (this.invuln > 0) this.invuln--;
+        if (this.hitFlash > 0) this.hitFlash--;
+
+        // Sinkronkan "current defense" bila nilai max diubah lewat slider/mod
+        const md = this.maxDefense();
+        this.defenseCurrent = clamp(this.defenseCurrent + (md - this.lastMaxDef), 0, md);
+        this.lastMaxDef = md;
+
+        // Permukaan di bawah tiap kaki & status menapak
+        const feet = [footL, footR], knees = [kneeL, kneeR];
+        const surf = feet.map(f => surfaceFor(f.x, f.y + FOOT_R));
+        const grd  = feet.map((f, i) => f.y >= surf[i] - FOOT_R - 4);
+
+        // ----- TERLEMPAR: ragdoll penuh (pinggul dilepas), input diabaikan, lalu bangun lagi -----
+        if (this.state === 'thrown') {
+            this.thrownT++;
+            this.supported = false;
+            this.prevJump = inp.jump; this.prevPunch = inp.punch;
+            const onGround = grd[0] || grd[1] || pelvis.y >= groundY - pelvis.r - 3;
+            const slow = Math.abs(pelvis.y - pelvis.oldY) < 2 && Math.abs(pelvis.x - pelvis.oldX) < 2;
+            if ((this.thrownT >= THROWN_MIN && onGround && slow) || this.thrownT >= THROWN_MAX) {
+                this.state = 'normal';
+                this.setRootPinned(true);                         // pulih: pinggul jadi akar lagi, otot aktif
+                pelvis.oldX = pelvis.x; pelvis.oldY = pelvis.y;
+                this.invuln = INVULN_AFTER;
+            } else return;
+        }
+
+        const dir = (inp.right ? 1 : 0) - (inp.left ? 1 : 0);
+        if (dir && this.punchT === 0) this.facing = dir;
+        const facing = this.facing;
+
+        // ----- PUKUL (tekan sekali = satu pukulan ke arah hadap) -----
+        const punchEdge = inp.punch && !this.prevPunch;
+        this.prevPunch = inp.punch;
+        if (this.punchCd > 0) this.punchCd--;
+        if (punchEdge && this.punchT === 0 && this.punchCd === 0) { this.punchT = 1; this.punchHit = false; }
+        else if (this.punchT > 0) {
+            this.punchT++;
+            if (this.punchT > PUNCH_FRAMES) { this.punchT = 0; this.punchCd = 6; }
+        }
+        const ext = this.punchT > 0 ? Math.sin(Math.PI * (this.punchT - 1) / (PUNCH_FRAMES - 1)) : 0;
+        // Tidak menapak selama pinggul masih bergerak naik (kaki yang lambat lepas dari lantai
+        // tidak boleh mengaktifkan penopang & memotong lompatan)
+        const rising = (pelvis.y - pelvis.oldY) < -1.5;
+        let supported = (grd[0] || grd[1]) && this.jumpCooldown <= 0 && !rising;
+
+        // ----- LOMPAT (tekan sekali = satu lompatan; buffer 6 frame agar terasa responsif) -----
+        const edge = inp.jump && !this.prevJump;
+        this.prevJump = inp.jump;
+        if (edge) this.jumpBuf = 6;
+        const wantJump = ALLOW_HOLD_JUMP ? inp.jump : this.jumpBuf > 0;
+        if (wantJump && supported) {
+            for (const p of this.points) p.oldY = p.y + jp;
+            this.jumpCooldown = 6; this.jumpBuf = 0;
+            supported = false;
+        } else if (this.jumpBuf > 0) this.jumpBuf--;
+        this.supported = supported;
+
+        // ----- PINGGUL: tumpuan utama berdiri -----
+        if (supported) {
+            let top = Infinity;
+            for (let i = 0; i < 2; i++) if (grd[i]) top = Math.min(top, surf[i]);
+            const ty = top - FOOT_R - LEG_LEN * heightRatio;
+            const dy = Math.max((ty - pelvis.y) * supportK, -GETUP_MAX);   // naik bertahap saat bangun
+            pelvis.y += dy; pelvis.oldY += dy;
+            pelvis.oldY = pelvis.y - (pelvis.y - pelvis.oldY) * 0.5;
+        }
+
+        // ----- GERAK HORIZONTAL -----
+        const accel = supported ? 0.08 + 0.17 * s : 0.04;
+        if (supported || dir) {
+            let vx = pelvis.x - pelvis.oldX;
+            vx += (dir * speed - vx) * accel;
+            pelvis.oldX = pelvis.x - vx;
+        }
+
+        // ----- BADAN & KEPALA -----
+        const lean = dir * (5 + (1 - s) * 4);
+        pull(neck, pelvis.x + facing * slouch + lean + facing * 4 * ext, pelvis.y - TORSO, kTorso, 0.5);
+        pull(head, neck.x + facing * slouch * 0.5 + lean * 0.5, neck.y - HEAD_DIST, kHead, 0.5);
+
+        // ----- KAKI -----
+        if (dir && supported) this.stepPhase += Math.PI * speed / (2 * stride);
+        for (let i = 0; i < 2; i++) {
+            const foot = feet[i], knee = knees[i], side = i === 0 ? -1 : 1;
+            let tx, ty;
+            if (supported) {
+                let lift = 0;
+                if (dir) {
+                    const ph = this.stepPhase + i * Math.PI;
+                    tx = pelvis.x + dir * stride * Math.cos(ph);
+                    lift = Math.max(0, -Math.sin(ph)) * STEP_HEIGHT;
+                } else tx = pelvis.x + side * STANCE;
+                ty = surfaceFor(tx, foot.y + FOOT_R) - FOOT_R - lift;
+            } else {
+                tx = pelvis.x + side * 6;
+                ty = pelvis.y + LEG_LEN * 0.8;
+            }
+            pull(foot, tx, ty, kFoot, 0.3);
+            pull(knee, (pelvis.x + foot.x) / 2 + facing * 6, (pelvis.y + foot.y) / 2, kKnee, 0.5);
+        }
+
+        // ----- TANGAN -----
+        const arms = [[elbowL, handL], [elbowR, handR]];
+        for (let i = 0; i < 2; i++) {
+            const side = i === 0 ? -1 : 1, [elbow, hand] = arms[i];
+            if (ext > 0 && i === (facing > 0 ? 1 : 0)) {          // tangan depan memukul ke arah hadap
+                pull(elbow, neck.x + facing * (6 + 16 * ext), neck.y + 10, 0.5, 0.2);
+                pull(hand,  neck.x + facing * (8 + 32 * ext), neck.y + 12, 0.6, 0.15);
+                continue;
+            }
+            if (supported) {
+                const swing = dir ? Math.sin(this.stepPhase + (i === 0 ? Math.PI : 0)) * 10 : 0;
+                pull(elbow, neck.x + side * 7 + swing * 0.5, neck.y + 18, kArm, 0.4);
+                pull(hand,  neck.x + side * 9 + swing,       neck.y + 36, kArm, 0.35);
+            } else {
+                pull(elbow, neck.x + side * 14, neck.y + 12, kArm, 0.4);
+                pull(hand,  neck.x + side * 22, neck.y + 22, kArm, 0.35);
+            }
+        }
+    }
+
+    // Cek kontak kepalan dengan titik tubuh lawan (satu pukulan = maksimal satu hit)
+    checkHit() {
+        if (this.state !== 'normal' || this.punchT === 0 || this.punchHit) return;
+        const ext = Math.sin(Math.PI * (this.punchT - 1) / (PUNCH_FRAMES - 1));
+        if (ext < 0.6) return;
+        const hand = this.facing > 0 ? this.j.handR : this.j.handL;
+        for (const o of chars) {
+            if (o === this || o.state !== 'normal' || o.invuln > 0) continue;
+            for (const p of o.points) {
+                if (Math.hypot(hand.x - p.x, hand.y - p.y) < FIST_R + p.r) {
+                    this.punchHit = true;
+                    o.receiveHit(this, hand.x, hand.y);
+                    return;
+                }
+            }
+        }
+    }
+
+    // Terkena hit: kurangi current defense; bila sudah habis => terlempar lalu defense pulih penuh
+    receiveHit(attacker, hx, hy) {
+        const mv = attacker.motionValue, dir = attacker.facing;
+        this.hitFlash = 8;
+        effects.push({ x: hx, y: hy, t: 0 });
+        if (this.defenseCurrent > 0) {
+            this.defenseCurrent--;
+            for (const p of this.points) p.oldX -= dir * mv * HIT_PUSH;      // terdorong sedikit
+        } else {
+            this.state = 'thrown'; this.thrownT = 0; this.punchT = 0; this.punchCd = 0;
+            this.setRootPinned(false);
+            this.defenseCurrent = this.maxDefense();                           // recover penuh
+            for (const p of this.points) {                                     // lempar seluruh tubuh
+                p.oldX = p.x - dir * mv * LAUNCH_X;
+                p.oldY = p.y + mv * LAUNCH_Y;
+            }
+        }
+    }
+
+    step() {
+        const g = this.stat('gravity');
+        for (const p of this.points) p.update(g);
+        this.controller();
+        for (let i = 0; i < 12; i++) {
+            for (const b of this.bones) b.resolve();
+            for (const p of this.points) {
+                p.bounds();
+                if (p.isFoot) for (const pl of platforms) pl.collide(p);   // hanya ujung kaki yang menapak platform
+            }
+        }
+        this.checkHit();
+    }
+
+    draw() {
+        const { head } = this.j;
+        const col = this.hitFlash > 0 ? '#ffffff' : this.color;
+        ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.lineCap = 'round';
+        for (const b of this.bones) {
+            ctx.beginPath(); ctx.moveTo(b.a.x, b.a.y); ctx.lineTo(b.b.x, b.b.y); ctx.stroke();
+        }
+        ctx.fillStyle = this.jointColor;
+        for (const p of this.points) {
+            if (p === head) continue;
+            ctx.beginPath(); ctx.arc(p.x, p.y, p.r - 1, 0, Math.PI * 2); ctx.fill();
+        }
+        ctx.beginPath(); ctx.arc(head.x, head.y, HEAD_R, 0, Math.PI * 2);
+        ctx.fillStyle = '#0f172a'; ctx.fill();
+        ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.stroke();
+        ctx.fillStyle = this.jointColor;
+        ctx.beginPath(); ctx.arc(head.x + this.facing * 5, head.y - 2, 2, 0, Math.PI * 2); ctx.fill();
+        // indikator motionDefense (titik terisi = sisa pertahanan)
+        const md = Math.min(this.maxDefense(), 10), w = 8;
+        for (let i = 0; i < md; i++) {
+            ctx.beginPath(); ctx.arc(head.x + (i - (md - 1) / 2) * w, head.y - HEAD_R - 12, 2.5, 0, Math.PI * 2);
+            if (i < this.defenseCurrent) { ctx.fillStyle = this.color; ctx.fill(); }
+            else { ctx.strokeStyle = this.color; ctx.lineWidth = 1; ctx.stroke(); }
+        }
+    }
+}
+
+// Karakter: P1 (biru, panah) & P2 (oranye, W A D)
+const p1 = new Ragdoll('P1', '#38bdf8', '#e0f2fe', { left: 'ArrowLeft', right: 'ArrowRight', jump: 'ArrowUp', punch: 'ArrowDown' });
+const p2 = new Ragdoll('P2', '#fb923c', '#ffedd5', { left: 'KeyA', right: 'KeyD', jump: 'KeyW', punch: 'KeyS' });
+const chars = [p1, p2];
+
+function resetChars() {
+    p1.build(width * 0.25);
+    p2.build(width * 0.35);
+}
+
+// ==========================================================
+//  PLATFORM
+// ==========================================================
+// 3 platform tangga otomatis (tiap tingkat <= kemampuan lompat). Platform buatan sendiri tidak ikut terhapus.
+// Perkiraan tinggi angkat KAKI saat lompat (hasil ukur simulasi, sengaja dibuat konservatif).
+// Makin letoy (strength rendah) makin kecil, karena lutut menekuk "memakan" sebagian lompatan.
+function estimateJumpRise() {
+    const s = MIN_STAND_STRENGTH + (1 - MIN_STAND_STRENGTH) * RAGDOLL_STRENGTH;
+    const est = jumpPower * jumpPower / (2 * GRAVITY);
+    return Math.max(0, 0.85 * est - 18 * (1 - s));
+}
+
+let autoPlatforms = true;     // false setelah "Hapus Semua" (supaya tidak muncul lagi sendiri)
+function buildAutoPlatforms() {
+    jumpHeightEst = estimateJumpRise();
+    platformStep = Math.max(10, jumpHeightEst * PLATFORM_STEP_RATIO);
+    platforms = platforms.filter(p => !p.auto);
+    if (!autoPlatforms) return;
+    const w = Math.min(170, width * 0.14), t = 12, x0 = width * 0.5 + 40;
+    for (let i = 1; i <= 3; i++)
+        platforms.push(new Platform(x0 + w * (i - 1), groundY - platformStep * i, w, t, true));
+}
+
+function placePlatform(mx, my) {
+    const w = platformWidth;
+    const x = clamp(mx - w / 2, 0, width - w);
+    const y = clamp(my, 40, groundY - 16);
+    platforms.push(new Platform(x, y, w, 12, false));
+}
+
+function removePlatformAt(mx, my) {
+    for (let i = platforms.length - 1; i >= 0; i--) {
+        const pl = platforms[i];
+        if (mx >= pl.x - 4 && mx <= pl.x + pl.w + 4 && my >= pl.y - 6 && my <= pl.y + pl.h + 6) {
+            platforms.splice(i, 1); return;
+        }
+    }
+}
+
+// ==========================================================
+//  LOOP
+// ==========================================================
+function step() {
+    for (const c of chars) c.step();
+    for (const f of effects) f.t++;
+    effects = effects.filter(f => f.t < 14);
+}
+
+function draw() {
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = '#334155'; ctx.fillRect(0, groundY, width, height - groundY);
+    ctx.fillStyle = '#475569'; ctx.fillRect(0, groundY, width, 3);
+    for (const pl of platforms) {
+        ctx.fillStyle = pl.auto ? '#475569' : '#4d5f4f'; ctx.fillRect(pl.x, pl.y, pl.w, pl.h);
+        ctx.fillStyle = pl.auto ? '#64748b' : '#6b8f71'; ctx.fillRect(pl.x, pl.y, pl.w, 3);
+    }
+    if (placing && mouse.inside) {                       // pratinjau platform
+        const w = platformWidth, x = clamp(mouse.x - w / 2, 0, width - w), y = clamp(mouse.y, 40, groundY - 16);
+        ctx.fillStyle = 'rgba(56,189,248,0.35)'; ctx.fillRect(x, y, w, 12);
+        ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 1; ctx.strokeRect(x, y, w, 12);
+    }
+    for (const c of chars) c.draw();
+    for (const f of effects) {                            // efek hit
+        ctx.strokeStyle = `rgba(255,255,255,${1 - f.t / 14})`; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(f.x, f.y, 4 + f.t * 2, 0, Math.PI * 2); ctx.stroke();
+    }
+
+    const s = MIN_STAND_STRENGTH + (1 - MIN_STAND_STRENGTH) * RAGDOLL_STRENGTH;
+    document.getElementById('state').textContent =
+        `Menapak P1: ${p1.supported ? 'ya' : 'tidak'} | P2: ${p2.supported ? 'ya' : 'tidak'}` +
+        ` | Strength efektif ${s.toFixed(2)} | Tinggi angkat kaki ~${jumpHeightEst.toFixed(0)}px\n` +
+        chars.map(c => `${c.name}: DEF ${c.defenseCurrent}/${c.maxDefense()}  MV ${c.motionValue.toFixed(1)}  [${c.state}]`).join(' | ');
+}
+
+const DT = 1000 / 60;      // fixed timestep 60 FPS
+let acc = 0, last = performance.now();
+function frame(now) {
+    acc += Math.min(now - last, 100); last = now;
+    while (acc >= DT) { step(); acc -= DT; }
+    draw();
+    requestAnimationFrame(frame);
+}
+
+// ==========================================================
+//  INPUT & UI
+// ==========================================================
+const bindCodes = new Set();
+for (const c of chars) Object.values(c.binds).forEach(k => bindCodes.add(k));
+
+function setKey(code, down) {
+    for (const c of chars)
+        for (const action of ['left', 'right', 'jump', 'punch'])
+            if (c.binds[action] === code) c.input[action] = down;
+}
+window.addEventListener('keydown', e => {
+    if (bindCodes.has(e.code)) { setKey(e.code, true); e.preventDefault(); }
+    if (e.code === 'KeyR') resetChars();
+    if (e.code === 'Escape') setPlacing(false);
+});
+window.addEventListener('keyup', e => {
+    if (bindCodes.has(e.code)) { setKey(e.code, false); e.preventDefault(); }
+});
+window.addEventListener('blur', () => { for (const c of chars) c.input = { left: false, right: false, jump: false, punch: false }; });
+
+function mousePos(e) { const r = canvas.getBoundingClientRect(); mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top; }
+canvas.addEventListener('pointermove', e => { mousePos(e); mouse.inside = true; });
+canvas.addEventListener('pointerleave', () => { mouse.inside = false; });
+canvas.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    mousePos(e);
+    if (placing) placePlatform(mouse.x, mouse.y);
+});
+canvas.addEventListener('contextmenu', e => { e.preventDefault(); mousePos(e); removePlatformAt(mouse.x, mouse.y); });
+
+function setPlacing(v) {
+    placing = v;
+    document.getElementById('btnAdd').classList.toggle('active', v);
+    canvas.style.cursor = v ? 'crosshair' : 'default';
+}
+function bindButton(id, fn) {
+    const el = document.getElementById(id);
+    el.addEventListener('click', () => { fn(); el.blur(); });
+}
+bindButton('btnAdd', () => setPlacing(!placing));
+bindButton('btnUndo', () => { for (let i = platforms.length - 1; i >= 0; i--) if (!platforms[i].auto) { platforms.splice(i, 1); return; } platforms.pop(); });
+bindButton('btnClear', () => { platforms = []; autoPlatforms = false; });
+bindButton('btnDefault', () => { autoPlatforms = true; buildAutoPlatforms(); });
+
+function bindSlider(id, outId, get, set, onCommit) {
+    const el = document.getElementById(id), out = document.getElementById(outId);
+    el.value = get(); out.textContent = get();
+    el.addEventListener('input', () => { set(parseFloat(el.value)); out.textContent = get(); });
+    el.addEventListener('change', () => { if (onCommit) onCommit(); el.blur(); });  // blur: tombol keyboard tidak menggeser slider
+}
+// Saat slider dilepas, 3 platform otomatis disesuaikan ulang (platform buatanmu tidak berubah)
+bindSlider('sStrength', 'vStrength', () => RAGDOLL_STRENGTH, v => RAGDOLL_STRENGTH = v, buildAutoPlatforms);
+bindSlider('sJump', 'vJump', () => jumpPower, v => jumpPower = v, buildAutoPlatforms);
+bindSlider('sGrav', 'vGrav', () => GRAVITY, v => GRAVITY = v, buildAutoPlatforms);
+bindSlider('sWalk', 'vWalk', () => walkingSpeed, v => walkingSpeed = v);
+bindSlider('sMV', 'vMV', () => motionValue, v => motionValue = v);
+bindSlider('sMD', 'vMD', () => motionDefense, v => motionDefense = v);
+bindSlider('sPlatW', 'vPlatW', () => platformWidth, v => platformWidth = v);
+
+function resize() {
+    width = canvas.width = window.innerWidth;
+    height = canvas.height = window.innerHeight;
+    groundY = height - FLOOR_HEIGHT;
+    buildAutoPlatforms();
+}
+window.addEventListener('resize', resize);
+
+// ==BOOT==
+resize();
+resetChars();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

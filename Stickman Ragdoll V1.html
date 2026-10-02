@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ragdoll Stickman Simulator</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #0f172a; /* Slate 900 */
+            color: #f8fafc;
+            font-family: 'Inter', sans-serif;
+            overflow: hidden; /* Prevent scrolling */
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            user-select: none;
+        }
+
+        #gameCanvas {
+            background: linear-gradient(to bottom, #1e293b, #0f172a);
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            display: block;
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            pointer-events: none;
+        }
+
+        h1 {
+            margin: 0;
+            font-size: 1.5rem;
+            color: #38bdf8; /* Sky 400 */
+            text-shadow: 0 0 10px rgba(56, 189, 248, 0.5);
+        }
+
+        p {
+            margin: 5px 0 0 0;
+            font-size: 0.9rem;
+            color: #94a3b8; /* Slate 400 */
+        }
+    </style>
+</head>
+<body>
+
+    <!-- UI Overlay -->
+    <div id="ui-layer">
+        <h1>Verlet Ragdoll Physics</h1>
+        <p>Drag the stickman with your mouse/finger to test the floppy physics.</p>
+        <p>Helmet dynamically rotates with the body.</p>
+    </div>
+
+    <!-- Main Canvas -->
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        // Game Configuration
+        const GRAVITY = 0.5;
+        const FRICTION = 0.99; // Air resistance
+        const BOUNCE = 0.7; // How bouncy the walls/floor are
+        const CONSTRAINT_ITERATIONS = 5; // Higher = stiffer body, lower = more floppy
+
+        let width, height;
+        
+        // Physics Objects
+        let points = [];
+        let constraints = [];
+        let platforms = [];
+
+        // Interaction
+        let mouse = { x: 0, y: 0, isDown: false };
+        let draggedPoint = null;
+
+        // Resize canvas to fill screen
+        function resize() {
+            width = window.innerWidth;
+            height = window.innerHeight;
+            canvas.width = width;
+            canvas.height = height;
+            initLevel();
+        }
+        window.addEventListener('resize', resize);
+
+        class Point {
+            constructor(x, y, radius = 5, isStatic = false) {
+                this.x = x;
+                this.y = y;
+                this.oldX = x;
+                this.oldY = y;
+                this.radius = radius;
+                this.isStatic = isStatic; // Pinned points don't move
+            }
+
+            update() {
+                if (this.isStatic) return;
+
+                // Verlet Integration Formula:
+                // Velocity = Current Position - Old Position
+                let vx = (this.x - this.oldX) * FRICTION;
+                let vy = (this.y - this.oldY) * FRICTION;
+
+                this.oldX = this.x;
+                this.oldY = this.y;
+
+                // Apply velocity and gravity
+                this.x += vx;
+                this.y += vy + GRAVITY;
+            }
+
+            constrainBounds() {
+                if (this.isStatic) return;
+
+                // Floor collision
+                if (this.y > height - this.radius) {
+                    this.y = height - this.radius;
+                    // Simulate bounce and friction on the ground
+                    let vx = (this.x - this.oldX) * 0.8; 
+                    this.oldY = this.y + (this.y - this.oldY) * BOUNCE;
+                    this.oldX = this.x - vx;
+                }
+                
+                // Walls
+                if (this.x > width - this.radius) {
+                    this.x = width - this.radius;
+                    this.oldX = this.x + (this.x - this.oldX) * BOUNCE;
+                } else if (this.x < this.radius) {
+                    this.x = this.radius;
+                    this.oldX = this.x + (this.x - this.oldX) * BOUNCE;
+                }
+            }
+        }
+
+        class Constraint {
+            constructor(p1, p2, stiffness = 1) {
+                this.p1 = p1;
+                this.p2 = p2;
+                this.stiffness = stiffness;
+                // Calculate resting distance based on initial positions
+                const dx = p1.x - p2.x;
+                const dy = p1.y - p2.y;
+                this.length = Math.sqrt(dx * dx + dy * dy);
+            }
+
+            resolve() {
+                const dx = this.p2.x - this.p1.x;
+                const dy = this.p2.y - this.p1.y;
+                const distance = Math.sqrt(dx * dx + dy * dy);
+                
+                // Difference between current distance and target length
+                const difference = this.length - distance;
+                
+                // Avoid division by zero
+                if (distance === 0) return;
+
+                // How much each point needs to move to satisfy the constraint
+                const percent = (difference / distance) / 2 * this.stiffness;
+                
+                const offsetX = dx * percent;
+                const offsetY = dy * percent;
+
+                if (!this.p1.isStatic) {
+                    this.p1.x -= offsetX;
+                    this.p1.y -= offsetY;
+                }
+                if (!this.p2.isStatic) {
+                    this.p2.x += offsetX;
+                    this.p2.y += offsetY;
+                }
+            }
+
+            draw() {
+                ctx.beginPath();
+                ctx.moveTo(this.p1.x, this.p1.y);
+                ctx.lineTo(this.p2.x, this.p2.y);
+                ctx.strokeStyle = '#38bdf8'; // Sky 400
+                ctx.lineWidth = 4;
+                ctx.lineCap = 'round';
+                ctx.stroke();
+            }
+        }
+
+        class Platform {
+            constructor(x, y, w, h) {
+                this.x = x;
+                this.y = y;
+                this.w = w;
+                this.h = h;
+            }
+
+            collide(point) {
+                if (point.isStatic) return;
+
+                // Simple AABB (Axis-Aligned Bounding Box) collision check
+                if (point.x + point.radius > this.x && 
+                    point.x - point.radius < this.x + this.w && 
+                    point.y + point.radius > this.y && 
+                    point.y - point.radius < this.y + this.h) {
+                    
+                    // Push point out of the platform (mostly up, assuming it falls on it)
+                    // Calculate penetration depths
+                    let fromTop = (point.y + point.radius) - this.y;
+                    
+                    // Simple resolution: push to top surface
+                    if (fromTop > 0 && point.oldY <= this.y) {
+                        point.y = this.y - point.radius;
+                        // Add friction and eliminate vertical bounce to stabilize
+                        let vx = (point.x - point.oldX) * 0.5; // High friction on platform
+                        point.oldY = point.y; 
+                        point.oldX = point.x - vx;
+                    }
+                }
+            }
+
+            draw() {
+                ctx.fillStyle = '#334155'; // Slate 700
+                ctx.fillRect(this.x, this.y, this.w, this.h);
+                
+                // Platform highlight
+                ctx.fillStyle = '#475569';
+                ctx.fillRect(this.x, this.y, this.w, 5);
+            }
+        }
+
+        function createRagdoll(x, y) {
+            points = [];
+            constraints = [];
+
+            // Anatomical Points
+            const head = new Point(x, y - 60, 15);        // 0
+            const neck = new Point(x, y - 30, 5);         // 1
+            const chest = new Point(x, y - 10, 5);        // 2
+            const pelvis = new Point(x, y + 20, 5);       // 3
+            
+            const shoulderL = new Point(x - 20, y - 30, 5); // 4
+            const elbowL = new Point(x - 30, y, 5);       // 5
+            const handL = new Point(x - 35, y + 30, 5);   // 6
+            
+            const shoulderR = new Point(x + 20, y - 30, 5); // 7
+            const elbowR = new Point(x + 30, y, 5);       // 8
+            const handR = new Point(x + 35, y + 30, 5);   // 9
+            
+            const hipL = new Point(x - 15, y + 20, 5);    // 10
+            const kneeL = new Point(x - 15, y + 60, 5);   // 11
+            const footL = new Point(x - 15, y + 100, 5);  // 12
+            
+            const hipR = new Point(x + 15, y + 20, 5);    // 13
+            const kneeR = new Point(x + 15, y + 60, 5);   // 14
+            const footR = new Point(x + 15, y + 100, 5);  // 15
+
+            points.push(head, neck, chest, pelvis, shoulderL, elbowL, handL, shoulderR, elbowR, handR, hipL, kneeL, footL, hipR, kneeR, footR);
+
+            // Constraints (Bones)
+            const addBone = (p1, p2, stiffness = 1) => {
+                constraints.push(new Constraint(p1, p2, stiffness));
+            };
+
+            // Spine
+            addBone(head, neck);
+            addBone(neck, chest);
+            addBone(chest, pelvis);
+
+            // Arms
+            addBone(neck, shoulderL);
+            addBone(shoulderL, elbowL);
+            addBone(elbowL, handL);
+            
+            addBone(neck, shoulderR);
+            addBone(shoulderR, elbowR);
+            addBone(elbowR, handR);
+
+            // Legs
+            addBone(pelvis, hipL);
+            addBone(hipL, kneeL);
+            addBone(kneeL, footL);
+            
+            addBone(pelvis, hipR);
+            addBone(hipR, kneeR);
+            addBone(kneeR, footR);
+
+            // Structural Constraints (to hold the body shape together)
+            // Keeping shoulders and hips apart
+            addBone(shoulderL, shoulderR, 0.8);
+            addBone(hipL, hipR, 0.8);
+            // Torso rigidity (cross bracing)
+            addBone(shoulderL, pelvis, 0.5);
+            addBone(shoulderR, pelvis, 0.5);
+            addBone(chest, shoulderL, 0.5);
+            addBone(chest, shoulderR, 0.5);
+        }
+
+        function drawHelmet(headPoint, neckPoint) {
+            // Calculate rotation angle based on neck-to-head direction
+            const dx = headPoint.x - neckPoint.x;
+            const dy = headPoint.y - neckPoint.y;
+            // Subtract PI/2 because default is looking right (0 rad), but our body is vertical
+            let angle = Math.atan2(dy, dx) + Math.PI / 2;
+
+            ctx.save();
+            ctx.translate(headPoint.x, headPoint.y);
+            ctx.rotate(angle);
+
+            // Draw a Gladiator-style helmet (Vibe design)
+            ctx.fillStyle = '#fbbf24'; // Amber/Gold
+            ctx.strokeStyle = '#b45309'; // Dark gold border
+            ctx.lineWidth = 2;
+
+            // Helmet Dome
+            ctx.beginPath();
+            ctx.arc(0, 0, 16, Math.PI, 0); 
+            ctx.fill();
+            ctx.stroke();
+
+            // Face guard (Cheeks)
+            ctx.beginPath();
+            ctx.moveTo(-16, 0);
+            ctx.lineTo(-12, 18);
+            ctx.lineTo(-5, 12);
+            ctx.lineTo(5, 12);
+            ctx.lineTo(12, 18);
+            ctx.lineTo(16, 0);
+            ctx.fill();
+            ctx.stroke();
+
+            // Plume (Red crest on top)
+            ctx.fillStyle = '#ef4444'; // Red 500
+            ctx.beginPath();
+            ctx.ellipse(0, -18, 5, 12, Math.PI / 2, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Eye slot (Black void)
+            ctx.fillStyle = '#1e293b';
+            ctx.fillRect(-8, 2, 16, 4);
+
+            ctx.restore();
+        }
+
+        function getDistance(p1, p2) {
+            return Math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2);
+        }
+
+        // Mouse and Touch Events
+        function handleStart(e) {
+            e.preventDefault(); // Prevent scrolling on touch
+            let clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            let clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            
+            mouse.x = clientX;
+            mouse.y = clientY;
+            mouse.isDown = true;
+
+            // Find closest point to drag
+            let closestDist = 50; // Pick radius
+            for (let p of points) {
+                let dist = getDistance(p, mouse);
+                if (dist < closestDist) {
+                    closestDist = dist;
+                    draggedPoint = p;
+                }
+            }
+        }
+
+        function handleMove(e) {
+            let clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            let clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            mouse.x = clientX;
+            mouse.y = clientY;
+        }
+
+        function handleEnd() {
+            mouse.isDown = false;
+            draggedPoint = null;
+        }
+
+        canvas.addEventListener('mousedown', handleStart);
+        canvas.addEventListener('mousemove', handleMove);
+        canvas.addEventListener('mouseup', handleEnd);
+        canvas.addEventListener('touchstart', handleStart, {passive: false});
+        canvas.addEventListener('touchmove', handleMove, {passive: false});
+        canvas.addEventListener('touchend', handleEnd);
+
+        function initLevel() {
+            platforms = [];
+            // Add some platforms for the stickman to fall onto
+            platforms.push(new Platform(width * 0.1, height * 0.6, 200, 20));
+            platforms.push(new Platform(width * 0.6, height * 0.4, 250, 20));
+            platforms.push(new Platform(width * 0.4, height * 0.8, 300, 20));
+            
+            createRagdoll(width / 2, 100);
+        }
+
+        function gameLoop() {
+            // Clear screen
+            ctx.clearRect(0, 0, width, height);
+
+            // Handle Dragging
+            if (draggedPoint && mouse.isDown) {
+                // Instantly move point to mouse, nullify velocity to avoid slingshot effect
+                draggedPoint.x = mouse.x;
+                draggedPoint.y = mouse.y;
+                draggedPoint.oldX = mouse.x;
+                draggedPoint.oldY = mouse.y;
+            }
+
+            // Physics Update Step
+            for (let p of points) {
+                p.update();
+            }
+
+            // Constraint Resolution Step (Multiple iterations for stability)
+            for (let i = 0; i < CONSTRAINT_ITERATIONS; i++) {
+                for (let c of constraints) {
+                    c.resolve();
+                }
+                
+                // Check collisions inside the loop for rigidity against objects
+                for (let p of points) {
+                    p.constrainBounds();
+                    for (let plat of platforms) {
+                        plat.collide(p);
+                    }
+                }
+            }
+
+            // Render Step
+            
+            // Draw platforms
+            for (let plat of platforms) {
+                plat.draw();
+            }
+
+            // Draw bones (constraints)
+            for (let c of constraints) {
+                c.draw();
+            }
+
+            // Draw points (Joints)
+            for (let i = 0; i < points.length; i++) {
+                let p = points[i];
+                
+                // Head is index 0, Neck is index 1
+                if (i === 0) {
+                    drawHelmet(p, points[1]);
+                    continue; // Skip drawing default circle for head
+                }
+
+                ctx.beginPath();
+                ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+                ctx.fillStyle = i === 1 ? 'transparent' : '#e0f2fe'; // Neck joint is invisible
+                ctx.fill();
+            }
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        // Start the engine
+        resize(); // Calls initLevel
+        gameLoop();
+
+    </script>
+</body>
+</html>

@@ -1,0 +1,881 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ragdoll Stickman - Crown Battle (Stable 3)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+    html, body { margin:0; height:100%; overflow:hidden; background:#0f172a; color:#f8fafc; font-family: system-ui, sans-serif; user-select:none; }
+    #gameCanvas { display:block; background:linear-gradient(#1e293b,#0f172a); }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+
+<script>
+// ==========================================================
+//  VARIABEL STATIS (V7-Public Stable)
+// ==========================================================
+const RAGDOLL_STRENGTH = 0.3;
+const jumpPower = 19.5;
+const GRAVITY = 0.95;
+const walkingSpeed = 5.5;
+const motionValue = 0.8;
+const POISE = 1;                 // Poise: jumlah hit yang ditahan sebelum terlempar (1 = hit ke-2 melempar). Sebelumnya 3.
+const motionDefense = POISE;
+const platformWidth = 150;
+
+const MIN_STAND_STRENGTH = 0.25;
+const ALLOW_HOLD_JUMP = false;
+const MAX_SPEED = 30;
+
+const PUNCH_FRAMES = 14;
+const FIST_R = 8;                // radius kepalan/lengan bawah untuk deteksi hit
+const HIT_PUSH = 8;
+const LAUNCH_X = 20, LAUNCH_Y = 22;
+const THROWN_MIN = 25, THROWN_MAX = 150;
+const INVULN_AFTER = 30;
+const GETUP_MAX = 6;
+
+// ---- Stable 3: hitbox, hitstop, ronde, platform poise, zombie ----
+const BODY_R = 5;                // setengah lebar tubuh lawan (hitbox tulang/badan); kepala memakai HEAD_R
+const HIT_ACTIVE_EXT = 0.45;     // pukulan mulai bisa mengenai saat ayunan >= 45% (sebelumnya 60%)
+const HITSTOP_HIT = 4;           // frame dunia membeku saat hit biasa
+const HITSTOP_THROW = 9;         // frame dunia membeku saat lawan terlempar
+const SHAKE_HIT = 2, SHAKE_THROW = 6;   // guncangan layar (px)
+const MAX_ROUNDS = 10;           // jumlah ronde (skor maksimum tiap pemain = 10)
+const OBSTACLE_ROUND = 4;        // ronde 4+ : platform rapuh (platform poise)
+const ZOMBIE_ROUND = 7;          // ronde 7+ : zombie (2 di ronde 7, +2 tiap ronde berikutnya)
+const PLATFORM_POISE = 1;        // injakan yang ditahan platform rapuh; injakan berikutnya membuatnya jatuh
+const PLATFORM_SHAKE = 14;       // frame bergetar sebelum jatuh
+const PLATFORM_RESPAWN = 180;    // frame sampai platform kembali (poise penuh)
+const ZOMBIE_SPEED = 0.5;        // pengali kecepatan jalan zombie
+const ZOMBIE_POISE = 1;          // poise zombie
+const ZOMBIE_MOTION = 0.6;       // kekuatan pukulan zombie
+const ZOMBIE_STOP = 24;          // jarak berhenti zombie dari target
+const REACH_UP = 120;            // tinggi lompat aman untuk generator (hasil ukur kaki naik +-173px)
+const MAX_TIERS = 7;             // batas tingkat vertikal agar satu ronde tidak terlalu panjang di layar tinggi
+const INTRO_FRAMES = 90, ROUND_END_FRAMES = 210, MATCH_END_FRAMES = 420;
+
+const FLOOR_HEIGHT = 60;
+const AIR_DRAG = 0.995;
+
+const HEAD_R = 12, FOOT_R = 4, JOINT_R = 4;
+const HEAD_DIST = 22, TORSO = 42;
+const UPPER_LEG = 28, LOWER_LEG = 28, LEG_LEN = UPPER_LEG + LOWER_LEG;
+const UPPER_ARM = 20, LOWER_ARM = 20;
+const STANCE = 9;
+const STRIDE = 16, STEP_HEIGHT = 9;
+
+// ==========================================================
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+let width, height, groundY;
+let platforms = [];
+let effects = [];
+let crown = { x: 0, y: 0, active: false };
+let gameOver = false;            // true saat splash akhir ronde/match (fisika dibekukan)
+let winnerName = "";
+let winnerColor = "";
+let zombies = [];
+let hitStop = 0, shakeT = 0, shakeAmp = 0;
+let round = 1, scoreP1 = 0, scoreP2 = 0;
+let phase = 'intro', phaseT = 0, fightBanner = 0, matchWinner = null;
+const NO_INPUT = Object.freeze({ left: false, right: false, jump: false, punch: false });
+function inputsEnabled() { return phase === 'fight'; }
+function allChars() { return chars.concat(zombies); }
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+class Point {
+    constructor(x, y, r) {
+        this.x = this.oldX = x; this.y = this.oldY = y; this.prevY = y;
+        this.r = r; this.pinX = false; this.pinY = false; this.isFoot = false;
+    }
+    update(g) {
+        this.prevY = this.y;
+        const vx = clamp((this.x - this.oldX) * AIR_DRAG, -MAX_SPEED, MAX_SPEED);
+        const vy = clamp((this.y - this.oldY) * AIR_DRAG, -MAX_SPEED, MAX_SPEED);
+        this.oldX = this.x; this.oldY = this.y;
+        this.x += vx;
+        this.y += vy + g;
+    }
+    land(surfaceY) {
+        this.y = surfaceY - this.r;
+        const vx = (this.x - this.oldX) * 0.6;
+        this.oldY = this.y + (this.y - this.oldY) * 0.05;
+        this.oldX = this.x - vx;
+    }
+    bounds() {
+        if (this.y > groundY - this.r) this.land(groundY);
+        if (this.y < this.r)          { this.y = this.r;          this.oldY = this.y; } // Memastikan tidak nembus atap layar
+        if (this.x > width - this.r)  { this.x = width - this.r;  this.oldX = this.x; }
+        if (this.x < this.r)          { this.x = this.r;          this.oldX = this.x; }
+    }
+}
+
+class Bone {
+    constructor(a, b, len) { this.a = a; this.b = b; this.len = len; }
+    resolve() {
+        const a = this.a, b = this.b;
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.hypot(dx, dy) || 0.0001;
+        const f = (this.len - d) / d;
+        const ax = a.pinX ? 0 : 1, bx = b.pinX ? 0 : 1, sx = ax + bx;
+        const ay = a.pinY ? 0 : 1, by = b.pinY ? 0 : 1, sy = ay + by;
+        if (sx > 0) { a.x -= dx * f * ax / sx; b.x += dx * f * bx / sx; }
+        if (sy > 0) { a.y -= dy * f * ay / sy; b.y += dy * f * by / sy; }
+    }
+}
+
+class Platform {
+    constructor(x, y, w, h) {
+        this.x = x; this.y = y; this.w = w; this.h = h; this.isGold = false;
+        this.oy = y; this.fragile = false; this.poise = PLATFORM_POISE;
+        this.state = 'solid'; this.t = 0; this.vy = 0; this.flash = 0;   // solid | shaking | falling
+    }
+    get solid() { return this.state === 'solid' || this.state === 'shaking'; }
+    stomp() {   // dipijak karakter: poise berkurang 1; bila sudah 0 => bergetar lalu jatuh
+        if (!this.fragile || this.state !== 'solid') return;
+        if (this.poise > 0) this.poise--;
+        else { this.state = 'shaking'; this.t = PLATFORM_SHAKE; }
+    }
+    update() {
+        if (this.flash > 0) this.flash--;
+        if (this.state === 'shaking') {
+            if (--this.t <= 0) { this.state = 'falling'; this.t = PLATFORM_RESPAWN; this.vy = 0; }
+        } else if (this.state === 'falling') {
+            this.vy += 0.8; this.y += this.vy;
+            if (--this.t <= 0) { this.state = 'solid'; this.y = this.oy; this.poise = PLATFORM_POISE; this.flash = 20; }
+        }
+    }
+    collide(p) {
+        if (!this.solid) return;
+        if (p.x < this.x || p.x > this.x + this.w) return;
+        const prevBottom = p.prevY + p.r, bottom = p.y + p.r;
+        if (prevBottom <= this.y + 2 && bottom > this.y) p.land(this.y);
+    }
+}
+
+function platformUnder(x, bottom) {
+    let best = null, by = groundY;
+    for (const pl of platforms)
+        if (pl.solid && x >= pl.x && x <= pl.x + pl.w && pl.y >= bottom - 6 && pl.y < by) { by = pl.y; best = pl; }
+    return best;
+}
+function surfaceFor(x, bottom) {
+    const pl = platformUnder(x, bottom);
+    return pl ? pl.y : groundY;
+}
+
+function distToSeg(px, py, a, b) {   // jarak titik ke ruas garis a-b
+    const dx = b.x - a.x, dy = b.y - a.y, l2 = dx * dx + dy * dy;
+    const t = l2 ? clamp(((px - a.x) * dx + (py - a.y) * dy) / l2, 0, 1) : 0;
+    return Math.hypot(px - (a.x + t * dx), py - (a.y + t * dy));
+}
+
+function pull(p, tx, ty, k, damp) {
+    const dx = (tx - p.x) * k, dy = (ty - p.y) * k;
+    p.x += dx; p.y += dy;
+    p.oldX += dx * damp; p.oldY += dy * damp;
+}
+
+// ==========================================================
+//  RAGDOLL SYSTEM
+// ==========================================================
+class Ragdoll {
+    constructor(name, color, jointColor, binds) {
+        this.name = name; this.color = color; this.jointColor = jointColor;
+        this.binds = binds;
+        this.input = { left: false, right: false, jump: false, punch: false };
+        this.isZombie = false; this.speedMul = 1; this.ai = null;
+        this.lastPlat = null; this.airT = 0;
+    }
+
+    get motionValue()   { return this.isZombie ? ZOMBIE_MOTION : motionValue; }
+    get motionDefense() { return this.isZombie ? ZOMBIE_POISE : motionDefense; }
+    maxDefense() { return Math.max(0, Math.round(this.motionDefense)); }
+
+    build(cx) {
+        this.points = []; this.bones = [];
+        const P = (x, y, r) => { const p = new Point(x, y, r); this.points.push(p); return p; };
+        const B = (a, b, l) => this.bones.push(new Bone(a, b, l));
+        const py = groundY - FOOT_R - LEG_LEN * 0.95;
+        const j = this.j = {};
+        j.pelvis = P(cx, py, JOINT_R);
+        j.neck   = P(cx, py - TORSO, JOINT_R);
+        j.head   = P(cx, py - TORSO - HEAD_DIST, HEAD_R);
+        j.elbowL = P(cx - 7, j.neck.y + UPPER_ARM, JOINT_R);
+        j.handL  = P(cx - 9, j.neck.y + UPPER_ARM + LOWER_ARM, JOINT_R);
+        j.elbowR = P(cx + 7, j.neck.y + UPPER_ARM, JOINT_R);
+        j.handR  = P(cx + 9, j.neck.y + UPPER_ARM + LOWER_ARM, JOINT_R);
+        j.kneeL  = P(cx - 5, py + UPPER_LEG, JOINT_R);
+        j.footL  = P(cx - STANCE, groundY - FOOT_R, FOOT_R);
+        j.kneeR  = P(cx + 5, py + UPPER_LEG, JOINT_R);
+        j.footR  = P(cx + STANCE, groundY - FOOT_R, FOOT_R);
+        B(j.neck, j.head, HEAD_DIST);
+        B(j.pelvis, j.neck, TORSO);
+        B(j.neck, j.elbowL, UPPER_ARM);   B(j.elbowL, j.handL, LOWER_ARM);
+        B(j.neck, j.elbowR, UPPER_ARM);   B(j.elbowR, j.handR, LOWER_ARM);
+        B(j.pelvis, j.kneeL, UPPER_LEG);  B(j.kneeL, j.footL, LOWER_LEG);
+        B(j.pelvis, j.kneeR, UPPER_LEG);  B(j.kneeR, j.footR, LOWER_LEG);
+        j.footL.isFoot = true; j.footR.isFoot = true;
+        this.setRootPinned(true);
+        this.state = 'normal'; this.thrownT = 0; this.invuln = 0; this.hitFlash = 0;
+        this.punchT = 0; this.punchCd = 0; this.prevPunch = false; this.punchHit = false;
+        this.defenseCurrent = this.lastMaxDef = this.maxDefense();
+        this.facing = 1; this.stepPhase = 0; this.jumpCooldown = 0;
+        this.jumpBuf = 0; this.prevJump = false; this.supported = false;
+        this.lastPlat = null; this.airT = 0;
+    }
+
+    setRootPinned(v) { this.j.pelvis.pinX = v; this.j.pelvis.pinY = v; }
+
+    controller() {
+        const { pelvis, neck, head, elbowL, handL, elbowR, handR, kneeL, footL, kneeR, footR } = this.j;
+        const s = MIN_STAND_STRENGTH + (1 - MIN_STAND_STRENGTH) * RAGDOLL_STRENGTH;
+
+        const kTorso = 0.05 + 0.30 * s, kHead = 0.04 + 0.25 * s, kArm = 0.02 + 0.18 * s;
+        const kKnee = 0.20 + 0.20 * s, kFoot = 0.35 + 0.15 * s, supportK = 0.25 + 0.25 * s;
+        const heightRatio = 0.80 + 0.17 * s;
+        const slouch = (1 - s) * 8;
+        const spd = walkingSpeed * this.speedMul;
+        const stride = clamp(STRIDE * spd / 2.6, 10, 34);
+
+        const inp = inputsEnabled() ? this.input : NO_INPUT;
+        if (this.jumpCooldown > 0) this.jumpCooldown--;
+        if (this.invuln > 0) this.invuln--;
+        if (this.hitFlash > 0) this.hitFlash--;
+
+        const md = this.maxDefense();
+        this.defenseCurrent = clamp(this.defenseCurrent + (md - this.lastMaxDef), 0, md);
+        this.lastMaxDef = md;
+
+        const feet = [footL, footR], knees = [kneeL, kneeR];
+        const surf = feet.map(f => surfaceFor(f.x, f.y + FOOT_R));
+        const grd  = feet.map((f, i) => f.y >= surf[i] - FOOT_R - 4);
+
+        if (this.state === 'thrown') {
+            this.thrownT++;
+            this.supported = false;
+            this.prevJump = inp.jump; this.prevPunch = inp.punch; this.lastPlat = null;
+            const onGround = grd[0] || grd[1] || pelvis.y >= groundY - pelvis.r - 3;
+            const slow = Math.abs(pelvis.y - pelvis.oldY) < 2 && Math.abs(pelvis.x - pelvis.oldX) < 2;
+            if ((this.thrownT >= THROWN_MIN && onGround && slow) || this.thrownT >= THROWN_MAX) {
+                this.state = 'normal';
+                this.setRootPinned(true);
+                pelvis.oldX = pelvis.x; pelvis.oldY = pelvis.y;
+                this.invuln = INVULN_AFTER;
+            } else return;
+        }
+
+        const dir = (inp.right ? 1 : 0) - (inp.left ? 1 : 0);
+        if (dir && this.punchT === 0) this.facing = dir;
+        const facing = this.facing;
+
+        const punchEdge = inp.punch && !this.prevPunch;
+        this.prevPunch = inp.punch;
+        if (this.punchCd > 0) this.punchCd--;
+        if (punchEdge && this.punchT === 0 && this.punchCd === 0) { this.punchT = 1; this.punchHit = false; }
+        else if (this.punchT > 0) {
+            this.punchT++;
+            if (this.punchT > PUNCH_FRAMES) { this.punchT = 0; this.punchCd = 6; }
+        }
+        const ext = this.punchT > 0 ? Math.sin(Math.PI * (this.punchT - 1) / (PUNCH_FRAMES - 1)) : 0;
+        const rising = (pelvis.y - pelvis.oldY) < -1.5;
+        let supported = (grd[0] || grd[1]) && this.jumpCooldown <= 0 && !rising;
+
+        const edge = inp.jump && !this.prevJump;
+        this.prevJump = inp.jump;
+        if (edge) this.jumpBuf = 6;
+        const wantJump = ALLOW_HOLD_JUMP ? inp.jump : this.jumpBuf > 0;
+        if (wantJump && supported) {
+            for (const p of this.points) p.oldY = p.y + jumpPower;
+            this.jumpCooldown = 6; this.jumpBuf = 0;
+            supported = false;
+        } else if (this.jumpBuf > 0) this.jumpBuf--;
+        this.supported = supported;
+
+        // Platform poise: hitung "injakan" baru (pendaratan / pindah platform). Zombie tidak ikut menginjak.
+        if (supported) {
+            let top = Infinity, standing = null;
+            for (let i = 0; i < 2; i++) if (grd[i] && surf[i] < top) { top = surf[i]; standing = platformUnder(feet[i].x, feet[i].y + FOOT_R); }
+            if (standing && standing !== this.lastPlat && !this.isZombie) standing.stomp();
+            this.lastPlat = standing;
+            this.airT = 0;
+        } else if (++this.airT >= 4) this.lastPlat = null;
+
+        if (supported) {
+            let top = Infinity;
+            for (let i = 0; i < 2; i++) if (grd[i]) top = Math.min(top, surf[i]);
+            const ty = top - FOOT_R - LEG_LEN * heightRatio;
+            const dy = Math.max((ty - pelvis.y) * supportK, -GETUP_MAX);
+            pelvis.y += dy; pelvis.oldY += dy;
+            pelvis.oldY = pelvis.y - (pelvis.y - pelvis.oldY) * 0.5;
+        }
+
+        const accel = supported ? 0.08 + 0.17 * s : 0.04;
+        if (supported || dir) {
+            let vx = pelvis.x - pelvis.oldX;
+            vx += (dir * spd - vx) * accel;
+            pelvis.oldX = pelvis.x - vx;
+        }
+
+        const lean = dir * (5 + (1 - s) * 4);
+        pull(neck, pelvis.x + facing * slouch + lean + facing * 4 * ext, pelvis.y - TORSO, kTorso, 0.5);
+        pull(head, neck.x + facing * slouch * 0.5 + lean * 0.5, neck.y - HEAD_DIST, kHead, 0.5);
+
+        if (dir && supported) this.stepPhase += Math.PI * spd / (2 * stride);
+        for (let i = 0; i < 2; i++) {
+            const foot = feet[i], knee = knees[i], side = i === 0 ? -1 : 1;
+            let tx, ty;
+            if (supported) {
+                let lift = 0;
+                if (dir) {
+                    const ph = this.stepPhase + i * Math.PI;
+                    tx = pelvis.x + dir * stride * Math.cos(ph);
+                    lift = Math.max(0, -Math.sin(ph)) * STEP_HEIGHT;
+                } else tx = pelvis.x + side * STANCE;
+                ty = surfaceFor(tx, foot.y + FOOT_R) - FOOT_R - lift;
+            } else {
+                tx = pelvis.x + side * 6;
+                ty = pelvis.y + LEG_LEN * 0.8;
+            }
+            pull(foot, tx, ty, kFoot, 0.3);
+            pull(knee, (pelvis.x + foot.x) / 2 + facing * 6, (pelvis.y + foot.y) / 2, kKnee, 0.5);
+        }
+
+        const arms = [[elbowL, handL], [elbowR, handR]];
+        for (let i = 0; i < 2; i++) {
+            const side = i === 0 ? -1 : 1, [elbow, hand] = arms[i];
+            if (ext > 0 && i === (facing > 0 ? 1 : 0)) {
+                pull(elbow, neck.x + facing * (6 + 16 * ext), neck.y + 10, 0.5, 0.2);
+                pull(hand,  neck.x + facing * (8 + 32 * ext), neck.y + 12, 0.6, 0.15);
+                continue;
+            }
+            if (supported) {
+                const swing = dir ? Math.sin(this.stepPhase + (i === 0 ? Math.PI : 0)) * 10 : 0;
+                pull(elbow, neck.x + side * 7 + swing * 0.5, neck.y + 18, kArm, 0.4);
+                pull(hand,  neck.x + side * 9 + swing,       neck.y + 36, kArm, 0.35);
+            } else {
+                pull(elbow, neck.x + side * 14, neck.y + 12, kArm, 0.4);
+                pull(hand,  neck.x + side * 22, neck.y + 22, kArm, 0.35);
+            }
+        }
+    }
+
+    // Hitbox: kepalan + tengah lengan bawah vs tulang lawan (kapsul) dan kepala (lingkaran)
+    checkHit() {
+        if (this.state !== 'normal' || this.punchT === 0 || this.punchHit || phase !== 'fight') return;
+        const ext = Math.sin(Math.PI * (this.punchT - 1) / (PUNCH_FRAMES - 1));
+        if (ext < HIT_ACTIVE_EXT) return;
+        const hand = this.facing > 0 ? this.j.handR : this.j.handL;
+        const elbow = this.facing > 0 ? this.j.elbowR : this.j.elbowL;
+        const fists = [hand, { x: (hand.x + elbow.x) / 2, y: (hand.y + elbow.y) / 2 }];
+        for (const o of allChars()) {
+            if (o === this || o.state !== 'normal' || o.invuln > 0) continue;
+            if (this.isZombie && o.isZombie) continue;           // zombie hanya memusuhi pemain
+            if (o.hitBy(fists)) {
+                this.punchHit = true;
+                o.receiveHit(this, hand.x, hand.y);
+                return;
+            }
+        }
+    }
+
+    hitBy(fists) {
+        const head = this.j.head;
+        for (const f of fists) {
+            if (Math.hypot(f.x - head.x, f.y - head.y) < FIST_R + HEAD_R) return true;
+            for (const b of this.bones) if (distToSeg(f.x, f.y, b.a, b.b) < FIST_R + BODY_R) return true;
+        }
+        return false;
+    }
+
+    receiveHit(attacker, hx, hy) {
+        const mv = attacker.motionValue, dir = attacker.facing;
+        this.hitFlash = 8;
+        effects.push({ x: hx, y: hy, t: 0 });
+        if (this.defenseCurrent > 0) {
+            this.defenseCurrent--;
+            for (const p of this.points) p.oldX -= dir * mv * HIT_PUSH;
+            hitStop = Math.max(hitStop, HITSTOP_HIT);
+            shakeT = Math.max(shakeT, HITSTOP_HIT + 4); shakeAmp = Math.max(shakeAmp, SHAKE_HIT);
+        } else {
+            this.state = 'thrown'; this.thrownT = 0; this.punchT = 0; this.punchCd = 0;
+            this.setRootPinned(false);
+            this.defenseCurrent = this.maxDefense();
+            for (const p of this.points) {
+                p.oldX = p.x - dir * mv * LAUNCH_X;
+                p.oldY = p.y + mv * LAUNCH_Y;
+            }
+            hitStop = HITSTOP_THROW;
+            shakeT = HITSTOP_THROW + 6; shakeAmp = SHAKE_THROW;
+        }
+    }
+
+    step() {
+        if (gameOver) return; // Freeze Physics if game is over
+        for (const p of this.points) p.update(GRAVITY);
+        if (this.ai) this.ai(this);
+        this.controller();
+        for (let i = 0; i < 12; i++) {
+            for (const b of this.bones) b.resolve();
+            for (const p of this.points) {
+                p.bounds();
+                if (p.isFoot) for (const pl of platforms) pl.collide(p);
+            }
+        }
+        this.checkHit();
+    }
+
+    draw() {
+        const { head } = this.j;
+        const col = this.hitFlash > 0 ? '#ffffff' : this.color;
+        ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.lineCap = 'round';
+        for (const b of this.bones) {
+            ctx.beginPath(); ctx.moveTo(b.a.x, b.a.y); ctx.lineTo(b.b.x, b.b.y); ctx.stroke();
+        }
+        ctx.fillStyle = this.jointColor;
+        for (const p of this.points) {
+            if (p === head) continue;
+            ctx.beginPath(); ctx.arc(p.x, p.y, p.r - 1, 0, Math.PI * 2); ctx.fill();
+        }
+        ctx.beginPath(); ctx.arc(head.x, head.y, HEAD_R, 0, Math.PI * 2);
+        ctx.fillStyle = '#0f172a'; ctx.fill();
+        ctx.strokeStyle = col; ctx.lineWidth = 4; ctx.stroke();
+        ctx.fillStyle = this.jointColor;
+        ctx.beginPath(); ctx.arc(head.x + this.facing * 5, head.y - 2, 2, 0, Math.PI * 2); ctx.fill();
+        
+        const md = Math.min(this.maxDefense(), 10), w = 8;
+        for (let i = 0; i < md; i++) {
+            ctx.beginPath(); ctx.arc(head.x + (i - (md - 1) / 2) * w, head.y - HEAD_R - 12, 2.5, 0, Math.PI * 2);
+            if (i < this.defenseCurrent) { ctx.fillStyle = this.color; ctx.fill(); }
+            else { ctx.strokeStyle = this.color; ctx.lineWidth = 1; ctx.stroke(); }
+        }
+    }
+}
+
+const p1 = new Ragdoll('P1', '#38bdf8', '#e0f2fe', { left: 'ArrowLeft', right: 'ArrowRight', jump: 'ArrowUp', punch: 'ArrowDown' });
+const p2 = new Ragdoll('P2', '#fb923c', '#ffedd5', { left: 'KeyA', right: 'KeyD', jump: 'KeyW', punch: 'KeyS' });
+const chars = [p1, p2];
+
+function randomizeColors() {
+    const colors = ['#ef4444', '#3b82f6', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#eab308'];   // hijau dikosongkan: warna zombie
+    let c1 = colors[Math.floor(Math.random() * colors.length)];
+    let c2;
+    do { c2 = colors[Math.floor(Math.random() * colors.length)]; } while (c1 === c2);
+    
+    p1.color = c1;
+    p2.color = c2;
+    p1.jointColor = '#ffffff';
+    p2.jointColor = '#ffffff';
+
+}
+
+function resetChars() {
+    p1.build(width * 0.35);
+    p2.build(width * 0.65);
+}
+
+// ==========================================================
+//  PLATFORM GENERATION (Random & Golden Crown)
+// ==========================================================
+// ----- Stable 3: generator acak yang dijamin bisa dicapai (cabang, zig-zag, lebar bervariasi) -----
+function hGap(a, b) { return Math.max(0, Math.max(a.x - (b.x + b.w), b.x - (a.x + a.w))); }
+function gapAllowed(dy) { return dy >= 0 ? 80 - 25 * Math.min(1, dy / REACH_UP) : 85; }   // batas aman (hasil ukur lompatan sempurna: 140px di datar, 80px di ketinggian 150px)
+function canReach(a, b) { const dy = a.y - b.y; return dy <= REACH_UP && hGap(a, b) <= gapAllowed(dy); }
+
+function tryGeneratePlatforms() {
+    const margin = 40, list = [], floorP = { x: 0, y: groundY, w: width, h: 0 };
+    const place = (y, w) => {
+        for (let k = 0; k < 30; k++) {
+            const cand = new Platform(margin + Math.random() * Math.max(0, width - w - margin * 2), y, w, 12);
+            if (!(canReach(floorP, cand) || list.some(p => canReach(p, cand)))) continue;
+            if (list.some(p => Math.abs(p.y - y) < 55 && hGap(p, cand) < 40)) continue;
+            return cand;
+        }
+        return null;
+    };
+    let y = groundY - (70 + Math.random() * 40), tiers = 0;
+    while (y >= 210 && tiers < MAX_TIERS) {
+        const n = tiers > 0 && Math.random() < 0.5 ? 2 : 1;     // kadang 2 platform di satu tingkat = rute alternatif
+        for (let c = 0; c < n; c++) {
+            const pl = place(y + (Math.random() - 0.5) * 24, platformWidth * (0.75 + Math.random() * 0.5));
+            if (pl) list.push(pl); else if (c === 0) return null;
+        }
+        tiers++;
+        y -= 60 + Math.random() * 60;
+    }
+    if (!list.length) return null;
+    const gy = Math.max(130, Math.min(...list.map(p => p.y)) - (60 + Math.random() * 50));
+    for (let k = 0; k < 40; k++) {
+        const gold = new Platform(margin + Math.random() * Math.max(0, width - platformWidth - margin * 2), gy, platformWidth, 12);
+        if (list.some(p => canReach(p, gold)) && !list.some(p => Math.abs(p.y - gy) < 55 && hGap(p, gold) < 40)) {
+            gold.isGold = true; list.push(gold); return list;
+        }
+    }
+    return null;
+}
+
+function verifyPlatforms(list) {   // semua platform (termasuk emas) harus terjangkau dari lantai
+    const floorP = { x: 0, y: groundY, w: width, h: 0 }, seen = new Set(), stack = [];
+    for (const p of list) if (canReach(floorP, p)) { seen.add(p); stack.push(p); }
+    while (stack.length) {
+        const a = stack.pop();
+        for (const b of list) if (!seen.has(b) && canReach(a, b)) { seen.add(b); stack.push(b); }
+    }
+    return list.every(p => seen.has(p));
+}
+
+function generateRandomPlatforms() {
+    for (let attempt = 0; attempt < 60; attempt++) {
+        const list = tryGeneratePlatforms();
+        if (list && verifyPlatforms(list)) {
+            platforms = list;
+            const gold = list[list.length - 1];
+            crown.x = gold.x + gold.w / 2;
+            crown.y = gold.y - 35;
+            crown.active = true;
+            return;
+        }
+    }
+    generateStairPlatforms();    // cadangan: generator tangga lama
+}
+
+function generateStairPlatforms() {
+    platforms = [];
+    
+    // Titik awal X yang lebih acak, tidak selalu di tengah
+    let safeMarginX = 60;
+    let safeWidth = width - platformWidth - (safeMarginX * 2);
+    let currentX = safeMarginX + Math.random() * safeWidth;
+    let currentY = groundY - 100;
+    
+    // Lempar arah ke sisi yang memiliki ruang lebih luas
+    let dir = currentX < width / 2 ? 1 : -1;
+
+    let numPlats = 5 + Math.floor(Math.random() * 4); // 5 to 8 levels
+
+    for (let i = 0; i < numPlats; i++) {
+        // BATAS ATAS LAYAR: Stop buat platform jika jarak ke langit-langit sisa < 160px
+        if (currentY < 160) {
+            break;
+        }
+
+        platforms.push(new Platform(currentX, currentY, platformWidth, 12));
+
+        // Jarak Vertikal: Dijamin bisa dicapai oleh jumpPower 19.5 (max height ~200px)
+        let jumpY = 75 + Math.random() * 45; 
+        currentY -= jumpY;
+
+        // Jarak Horizontal: Overlap ringan sampai jarak lompat wajar
+        let moveX = (70 + Math.random() * 80) * dir;
+        currentX += moveX;
+
+        // Bounce dari dinding: Mencegah platform keluar dari sisi kiri atau kanan layar
+        if (currentX < 20) {
+            currentX = 20 + Math.random() * 40;
+            dir = 1; // Pantulkan balik ke kanan
+        } else if (currentX > width - platformWidth - 20) {
+            currentX = width - platformWidth - 20 - Math.random() * 40;
+            dir = -1; // Pantulkan balik ke kiri
+        }
+    }
+
+    // Platform Tertinggi (Golden)
+    // GARANSI: Koordinat Y mahkota tidak akan pernah tembus keluar browser
+    if (currentY < 90) currentY = 90; 
+    
+    let goldPlat = new Platform(currentX, currentY, platformWidth, 12);
+    goldPlat.isGold = true;
+    platforms.push(goldPlat);
+
+    crown.x = currentX + platformWidth / 2;
+    crown.y = currentY - 35; // Berada sempurna di atas platform
+    crown.active = true;
+}
+
+// ==========================================================
+//  GAME LOGIC
+// ==========================================================
+function checkWinCondition() {
+    if (gameOver || !crown.active || phase !== 'fight') return;
+    let best = null, bestD = 35;                       // yang paling dekat ke mahkota menang (bila bersamaan)
+    const gold = platforms.find(p => p.isGold);
+    for (const c of chars) {
+        // Harus berada DI ATAS platform emas: mahkota tidak bisa diambil dari bawah dengan menembus platform
+        if (gold && Math.max(c.j.footL.y, c.j.footR.y) + FOOT_R > gold.y + 2) continue;
+        const d = Math.min(Math.hypot(c.j.head.x - crown.x, c.j.head.y - crown.y),
+                           Math.hypot(c.j.pelvis.x - crown.x, c.j.pelvis.y - crown.y));
+        if (d < bestD) { bestD = d; best = c; }
+    }
+    if (best) endRound(best);
+}
+
+// ---------- Ronde & skor ----------
+function roundZombies(r) { return r >= ZOMBIE_ROUND ? 2 + 2 * (Math.min(r, MAX_ROUNDS) - ZOMBIE_ROUND) : 0; }
+
+function endRound(winner) {
+    crown.active = false; gameOver = true;
+    winnerName = winner.name; winnerColor = winner.color;
+    if (winner === p1) scoreP1++; else scoreP2++;
+    if (round >= MAX_ROUNDS && scoreP1 !== scoreP2) {       // ronde terakhir selesai & ada pemenang (atau Sudden Death selesai)
+        matchWinner = scoreP1 > scoreP2 ? p1 : p2;
+        phase = 'matchEnd'; phaseT = MATCH_END_FRAMES;
+    } else { phase = 'roundEnd'; phaseT = ROUND_END_FRAMES; }
+}
+
+function startRound() {
+    gameOver = false; hitStop = 0; shakeT = 0; shakeAmp = 0; effects = [];
+    generateRandomPlatforms();
+    if (round >= OBSTACLE_ROUND) for (const pl of platforms) if (!pl.isGold && Math.random() < 0.5) pl.fragile = true;
+    resetChars();
+    spawnZombies(roundZombies(round));
+    phase = 'intro'; phaseT = INTRO_FRAMES; fightBanner = 0;
+}
+
+function newMatch() {
+    round = 1; scoreP1 = 0; scoreP2 = 0; matchWinner = null;
+    randomizeColors();          // warna diacak per match (bukan per ronde) supaya skor mudah dibaca
+    startRound();
+}
+
+// ---------- Zombie ----------
+function zombieAI(z) {
+    const inp = z.input;
+    inp.left = inp.right = inp.jump = inp.punch = false;
+    if (phase !== 'fight' || z.state !== 'normal') return;
+    let tgt = null, best = Infinity;
+    for (const c of chars) {
+        const d = Math.abs(c.j.pelvis.x - z.j.pelvis.x) + Math.abs(c.j.pelvis.y - z.j.pelvis.y) + (c.state === 'normal' ? 0 : 400);
+        if (d < best) { best = d; tgt = c; }
+    }
+    if (!tgt) return;
+    const dx = tgt.j.pelvis.x - z.j.pelvis.x, dy = tgt.j.pelvis.y - z.j.pelvis.y;
+    if (Math.abs(dx) > ZOMBIE_STOP) { inp.right = dx > 0; inp.left = dx < 0; }
+    if (z.aiJump > 0) z.aiJump--;
+    if (z.supported && dy < -50 && Math.abs(dx) < 170 && z.aiJump <= 0) { inp.jump = true; z.aiJump = 40 + Math.random() * 40; }
+    if (Math.abs(dx) < 46 && Math.abs(dy) < 45 && Math.random() < 0.06) {
+        if (z.punchT === 0) z.facing = dx > 0 ? 1 : -1;
+        inp.punch = true;
+    }
+}
+
+function spawnZombies(n) {
+    zombies = [];
+    const xs = [];
+    for (let i = 0; i < n; i++) {
+        let x = 0, tries = 0;
+        do { x = 50 + Math.random() * Math.max(1, width - 100); tries++; }
+        while (tries < 40 && (chars.some(c => Math.abs(c.j.pelvis.x - x) < 220) || xs.some(v => Math.abs(v - x) < 70)));
+        xs.push(x);
+        const z = new Ragdoll('Z' + (i + 1), '#84cc16', '#ecfccb', {});
+        z.isZombie = true; z.speedMul = ZOMBIE_SPEED; z.ai = zombieAI; z.aiJump = 0;
+        z.build(x);
+        zombies.push(z);
+    }
+}
+
+function step() {
+    if (shakeT > 0 && --shakeT === 0) shakeAmp = 0;
+    if (fightBanner > 0) fightBanner--;
+    // timer fase berbasis frame (tidak terpengaruh resize / pindah tab)
+    if (phase === 'intro') { if (--phaseT <= 0) { phase = 'fight'; fightBanner = 40; } }
+    else if (phase === 'roundEnd') { if (--phaseT <= 0) { round++; startRound(); return; } }
+    else if (phase === 'matchEnd') { if (--phaseT <= 0) { newMatch(); return; } }
+    for (const f of effects) f.t++;
+    effects = effects.filter(f => f.t < 14);
+    if (hitStop > 0) { hitStop--; return; }          // HITSTOP: seluruh dunia membeku sesaat
+    if (!gameOver) for (const pl of platforms) pl.update();
+    for (const c of allChars()) c.step();
+    checkWinCondition();
+}
+
+// ---------- HUD & splash ala arcade ----------
+const ARCADE = '"Press Start 2P", "Courier New", monospace';
+
+function drawPip(x, y, r, color, lit) {
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    if (lit) {
+        ctx.shadowColor = color; ctx.shadowBlur = 16; ctx.fillStyle = color; ctx.fill();
+        ctx.shadowBlur = 0; ctx.fillStyle = 'rgba(255,255,255,0.6)';
+        ctx.beginPath(); ctx.arc(x - r * 0.3, y - r * 0.3, r * 0.35, 0, Math.PI * 2); ctx.fill();
+    } else {
+        ctx.strokeStyle = 'rgba(148,163,184,0.45)'; ctx.lineWidth = 2; ctx.stroke();
+    }
+    ctx.shadowBlur = 0;
+}
+
+function drawHUD() {
+    const sc = clamp(width / 1000, 0.55, 1), R = 7, gap = 22, off = 82, sd = round > MAX_ROUNDS;
+    ctx.save();
+    ctx.translate(width / 2, 14 * sc); ctx.scale(sc, sc);
+    ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(8,10,30,0.85)'; ctx.fillRect(-62, 0, 124, 52);
+    ctx.strokeStyle = '#22d3ee'; ctx.lineWidth = 3; ctx.shadowColor = '#22d3ee'; ctx.shadowBlur = 12;
+    ctx.strokeRect(-62, 0, 124, 52); ctx.shadowBlur = 0;
+    ctx.font = `10px ${ARCADE}`; ctx.fillStyle = '#fde047'; ctx.fillText(sd ? 'SUDDEN' : 'ROUND', 0, 15);
+    ctx.font = `${sd ? 14 : 20}px ${ARCADE}`; ctx.fillStyle = '#ffffff';
+    ctx.shadowColor = '#f0abfc'; ctx.shadowBlur = 8;
+    ctx.fillText(sd ? 'DEATH' : `${round}/${MAX_ROUNDS}`, 0, 37); ctx.shadowBlur = 0;
+    for (let i = 0; i < MAX_ROUNDS; i++) {
+        drawPip(-(off + i * gap), 20, R, p1.color, i < scoreP1);
+        drawPip(off + i * gap, 20, R, p2.color, i < scoreP2);
+    }
+    ctx.font = `9px ${ARCADE}`;
+    ctx.textAlign = 'right'; ctx.fillStyle = p1.color; ctx.fillText(`P1  ${scoreP1}/${MAX_ROUNDS}`, -off + R, 46);
+    ctx.textAlign = 'left';  ctx.fillStyle = p2.color; ctx.fillText(`${scoreP2}/${MAX_ROUNDS}  P2`, off - R, 46);
+    ctx.restore();
+}
+
+function drawSplash() {
+    const cx = width / 2, cy = height / 2, sc = clamp(width / 1100, 0.5, 1);
+    const glow = (txt, y, size, color) => {
+        ctx.font = `${Math.round(size * sc)}px ${ARCADE}`; ctx.fillStyle = color;
+        ctx.shadowColor = color; ctx.shadowBlur = 18; ctx.fillText(txt, cx, y); ctx.shadowBlur = 0;
+    };
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    if (phase === 'intro' || fightBanner > 0) {
+        if (phase === 'intro') {
+            glow(round > MAX_ROUNDS ? 'SUDDEN DEATH' : `ROUND ${round}`, cy - 40 * sc, 56, '#fde047');
+            const nz = roundZombies(round);
+            if (nz) glow(`ZOMBIES x${nz}`, cy + 20 * sc, 22, '#84cc16');
+            else if (round >= OBSTACLE_ROUND) glow('CRUMBLING PLATFORMS', cy + 20 * sc, 22, '#f59e0b');
+        } else glow('FIGHT!', cy - 40 * sc, 72, '#f87171');
+        if (phase === 'intro') {
+            ctx.font = `10px ${ARCADE}`; ctx.fillStyle = '#94a3b8';
+            ctx.fillText('P1: ARROWS MOVE  UP JUMP  DOWN PUNCH', cx, groundY + 22);
+            ctx.fillText('P2: A / D MOVE  W JUMP  S PUNCH', cx, groundY + 42);
+        }
+        return;
+    }
+    if (!gameOver) return;
+    ctx.fillStyle = 'rgba(8,10,30,0.88)'; ctx.fillRect(0, 0, width, height);
+    const isMatch = phase === 'matchEnd';
+    const score = (y, size) => {
+        ctx.font = `${Math.round(size * sc)}px ${ARCADE}`;
+        const t = `${scoreP1}  :  ${scoreP2}`;
+        ctx.fillStyle = '#ffffff'; ctx.shadowColor = '#22d3ee'; ctx.shadowBlur = 14; ctx.fillText(t, cx, y); ctx.shadowBlur = 0;
+        ctx.font = `${Math.round(14 * sc)}px ${ARCADE}`;
+        ctx.fillStyle = p1.color; ctx.fillText('P1', cx - 230 * sc, y);
+        ctx.fillStyle = p2.color; ctx.fillText('P2', cx + 230 * sc, y);
+    };
+    if (isMatch) {
+        glow(`PLAYER ${matchWinner.name} WINS THE MATCH!`, cy - 90 * sc, 30, matchWinner.color);
+        glow('FINAL SCORE', cy - 30 * sc, 16, '#fde047');
+        score(cy + 25 * sc, 40);
+    } else {
+        glow(`PLAYER ${winnerName} WINS!`, cy - 100 * sc, 40, winnerColor);
+        glow(`ROUND ${round} / ${MAX_ROUNDS}`, cy - 45 * sc, 18, '#fde047');
+        score(cy + 15 * sc, 40);
+        if (round >= MAX_ROUNDS) glow('TIED - SUDDEN DEATH NEXT!', cy + 80 * sc, 16, '#f87171');
+    }
+    ctx.font = `${Math.round(11 * sc)}px ${ARCADE}`; ctx.fillStyle = '#94a3b8';
+    ctx.fillText(`1 ROUND WIN = 1 POINT   |   ${MAX_ROUNDS} ROUNDS   |   MAX SCORE ${MAX_ROUNDS}`, cx, cy + 130 * sc);
+    if (Math.floor(Date.now() / 450) % 2 === 0) { ctx.fillStyle = '#e2e8f0'; ctx.fillText(isMatch ? 'NEW MATCH SOON... (ENTER)' : 'NEXT ROUND... (ENTER)', cx, cy + 165 * sc); }
+}
+
+function draw() {
+    ctx.clearRect(0, 0, width, height);
+    ctx.save();
+    if (shakeT > 0) { const a = shakeAmp * Math.min(1, shakeT / 6); ctx.translate((Math.random() - 0.5) * 2 * a, (Math.random() - 0.5) * 2 * a); }
+    ctx.fillStyle = '#334155'; ctx.fillRect(0, groundY, width, height - groundY);
+    ctx.fillStyle = '#475569'; ctx.fillRect(0, groundY, width, 3);
+    
+    // Draw Platforms
+    for (const pl of platforms) {
+        const dx = pl.state === 'shaking' ? (Math.random() - 0.5) * 4 : 0;
+        ctx.globalAlpha = pl.state === 'falling' ? clamp(1 - (pl.y - pl.oy) / 220, 0, 1) : 1;
+        if (pl.isGold) {
+            ctx.shadowColor = "rgba(251, 191, 36, 0.8)";
+            ctx.shadowBlur = 20;
+            ctx.fillStyle = '#fbbf24'; ctx.fillRect(pl.x, pl.y, pl.w, pl.h);
+            ctx.fillStyle = '#fef08a'; ctx.fillRect(pl.x, pl.y, pl.w, 3);
+            ctx.shadowBlur = 0;
+        } else {
+            let c1 = '#4d5f4f', c2 = '#6b8f71';
+            if (pl.fragile) { if (pl.poise > 0) { c1 = '#6b5a3f'; c2 = '#d9a441'; } else { c1 = '#5a3b2e'; c2 = '#f97316'; } }
+            ctx.fillStyle = c1; ctx.fillRect(pl.x + dx, pl.y, pl.w, pl.h);
+            ctx.fillStyle = c2; ctx.fillRect(pl.x + dx, pl.y, pl.w, 3);
+            if (pl.fragile && pl.poise === 0) {          // retakan: injakan berikutnya = jatuh
+                ctx.strokeStyle = '#1f130d'; ctx.lineWidth = 1.5; ctx.beginPath();
+                for (const f of [0.22, 0.52, 0.8]) { ctx.moveTo(pl.x + dx + pl.w * f, pl.y); ctx.lineTo(pl.x + dx + pl.w * f - 5, pl.y + pl.h); }
+                ctx.stroke();
+            }
+        }
+        if (pl.flash > 0) { ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.strokeRect(pl.x, pl.y, pl.w, pl.h); }
+        ctx.globalAlpha = 1;
+    }
+    
+    // Draw Crown
+    if (crown.active) {
+        let floatY = Math.sin(Date.now() / 250) * 8;
+        ctx.shadowColor = "#fbbf24";
+        ctx.shadowBlur = 15;
+        ctx.font = "32px Arial";
+        ctx.textAlign = "center";
+        ctx.fillText("👑", crown.x, crown.y + floatY);
+        ctx.shadowBlur = 0;
+    }
+
+    for (const c of allChars()) c.draw();
+    for (const f of effects) {
+        ctx.strokeStyle = `rgba(255,255,255,${1 - f.t / 14})`; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.arc(f.x, f.y, 4 + f.t * 2, 0, Math.PI * 2); ctx.stroke();
+    }
+
+    ctx.restore();           // akhir guncangan layar
+    drawHUD();
+    drawSplash();
+}
+
+const DT = 1000 / 60;
+let acc = 0, last = performance.now();
+function frame(now) {
+    acc += Math.min(now - last, 100); last = now;
+    while (acc >= DT) { step(); acc -= DT; }
+    draw();
+    requestAnimationFrame(frame);
+}
+
+// ==========================================================
+//  INPUT & INIT
+// ==========================================================
+const bindCodes = new Set();
+for (const c of chars) Object.values(c.binds).forEach(k => bindCodes.add(k));
+
+function setKey(code, down) {
+    for (const c of chars)
+        for (const action of ['left', 'right', 'jump', 'punch'])
+            if (c.binds[action] === code) c.input[action] = down;
+}
+window.addEventListener('keydown', e => {
+    if (bindCodes.has(e.code)) { setKey(e.code, true); e.preventDefault(); }
+    if (e.code === 'Enter' && (phase === 'roundEnd' || phase === 'matchEnd')) phaseT = 1;   // lewati splash
+});
+window.addEventListener('keyup', e => {
+    if (bindCodes.has(e.code)) { setKey(e.code, false); e.preventDefault(); }
+});
+window.addEventListener('blur', () => { for (const c of chars) c.input = { left: false, right: false, jump: false, punch: false }; });
+
+function resize() {
+    width = canvas.width = window.innerWidth;
+    height = canvas.height = window.innerHeight;
+    groundY = height - FLOOR_HEIGHT;
+}
+window.addEventListener('resize', () => {
+    resize();
+    if (phase === 'intro' || phase === 'fight') startRound();     // ulang ronde yang sama, skor tetap
+});
+
+// ==BOOT==
+resize();
+newMatch();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

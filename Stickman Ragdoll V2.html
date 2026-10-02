@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Active Ragdoll - Berjalan & Melompat</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background: #2c3e50;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            color: white;
+            font-family: sans-serif;
+            overflow: hidden;
+        }
+        canvas {
+            background: #ecf0f1;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            pointer-events: none;
+        }
+        h1 { margin: 0 0 10px 0; font-size: 24px; text-shadow: 2px 2px 4px rgba(0,0,0,0.8); }
+        p { margin: 5px 0; font-size: 14px; text-shadow: 1px 1px 2px rgba(0,0,0,0.8); }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <h1>Active Ragdoll Engine</h1>
+        <p>🎮 <b>KONTROL:</b> Arrow Kiri / Kanan untuk Jalan | Arrow Atas untuk Lompat</p>
+        <p>🖱️ <b>MOUSE:</b> Klik dan Tarik badan stickman untuk melihat efek Ragdoll</p>
+    </div>
+
+    <canvas id="gameCanvas" width="800" height="500"></canvas>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+
+    // Pengaturan Fisika Verlet
+    const GRAVITY = 0.6;
+    const FRICTION = 0.99;
+    const GROUND_FRICTION = 0.8;
+    const BOUNCE = 0.2;
+    const STIFFNESS = 7; // Jumlah iterasi kalkulasi agar tulang tidak melar
+
+    // Input State
+    const keys = { ArrowLeft: false, ArrowRight: false, ArrowUp: false };
+    
+    window.addEventListener('keydown', e => { if (keys.hasOwnProperty(e.code)) keys[e.code] = true; });
+    window.addEventListener('keyup', e => { if (keys.hasOwnProperty(e.code)) keys[e.code] = false; });
+
+    class Point {
+        constructor(x, y, radius = 5, mass = 1) {
+            this.x = x; this.y = y;
+            this.oldX = x; this.oldY = y;
+            this.radius = radius;
+            this.mass = mass;
+            this.isPinned = false;
+        }
+    }
+
+    class Stick {
+        constructor(p0, p1, length = null) {
+            this.p0 = p0;
+            this.p1 = p1;
+            this.length = length || Math.hypot(p1.x - p0.x, p1.y - p0.y);
+        }
+    }
+
+    // Variabel Global Engine
+    let points = [];
+    let sticks = [];
+    let groundY = canvas.height - 50;
+    
+    // Titik-titik penting untuk referensi postur
+    let head, neck, pelvis, leftFoot, rightFoot;
+
+    function createStickman(x, y) {
+        points = []; sticks = [];
+        
+        // Membuat Titik (Joints)
+        head = new Point(x, y - 100, 12);
+        neck = new Point(x, y - 70, 5);
+        pelvis = new Point(x, y - 20, 8);
+        
+        const leftElbow = new Point(x - 20, y - 50, 4);
+        const rightElbow = new Point(x + 20, y - 50, 4);
+        const leftHand = new Point(x - 40, y - 30, 4);
+        const rightHand = new Point(x + 40, y - 30, 4);
+        
+        const leftKnee = new Point(x - 15, y + 20, 5);
+        const rightKnee = new Point(x + 15, y + 20, 5);
+        leftFoot = new Point(x - 20, y + 60, 6);
+        rightFoot = new Point(x + 20, y + 60, 6);
+
+        points.push(head, neck, pelvis, leftElbow, rightElbow, leftHand, rightHand, leftKnee, rightKnee, leftFoot, rightFoot);
+
+        // Membuat Tulang (Sticks/Constraints)
+        sticks.push(new Stick(head, neck));
+        sticks.push(new Stick(neck, pelvis));
+        
+        sticks.push(new Stick(neck, leftElbow));
+        sticks.push(new Stick(leftElbow, leftHand));
+        sticks.push(new Stick(neck, rightElbow));
+        sticks.push(new Stick(rightElbow, rightHand));
+        
+        sticks.push(new Stick(pelvis, leftKnee));
+        sticks.push(new Stick(leftKnee, leftFoot));
+        sticks.push(new Stick(pelvis, rightKnee));
+        sticks.push(new Stick(rightKnee, rightFoot));
+    }
+
+    function updatePoints() {
+        for (let p of points) {
+            if (p.isPinned) continue;
+
+            // Kalkulasi kecepatan (Velocity) dari perbedaan posisi saat ini dan sebelumnya
+            let vx = (p.x - p.oldX) * FRICTION;
+            let vy = (p.y - p.oldY) * FRICTION;
+
+            p.oldX = p.x;
+            p.oldY = p.y;
+
+            p.x += vx;
+            p.y += vy;
+            p.y += GRAVITY; // Terapkan gravitasi
+
+            // Deteksi tabrakan dengan lantai
+            if (p.y + p.radius > groundY) {
+                p.y = groundY - p.radius;
+                // Ground friction agar tidak meluncur seperti di es
+                p.oldX = p.x - vx * GROUND_FRICTION; 
+                p.oldY = p.y + vy * BOUNCE;
+            }
+            
+            // Batas layar Kiri Kanan
+            if (p.x < 0) { p.x = 0; p.oldX = p.x + vx * BOUNCE; }
+            if (p.x > canvas.width) { p.x = canvas.width; p.oldX = p.x + vx * BOUNCE; }
+        }
+    }
+
+    function updateSticks() {
+        for (let i = 0; i < STIFFNESS; i++) {
+            for (let s of sticks) {
+                let dx = s.p1.x - s.p0.x;
+                let dy = s.p1.y - s.p0.y;
+                let distance = Math.hypot(dx, dy);
+                let difference = s.length - distance;
+                let percent = difference / distance / 2;
+                let offsetX = dx * percent;
+                let offsetY = dy * percent;
+
+                if (!s.p0.isPinned) {
+                    s.p0.x -= offsetX;
+                    s.p0.y -= offsetY;
+                }
+                if (!s.p1.isPinned) {
+                    s.p1.x += offsetX;
+                    s.p1.y += offsetY;
+                }
+            }
+        }
+    }
+
+    // --- FITUR BARU: POSTUR & KONTROL MUSCLE ---
+    function applyActiveRagdollLogic() {
+        let centerFeetX = (leftFoot.x + rightFoot.x) / 2;
+        
+        // 1. POSTUR: Tarik Panggul agar berada di tengah-tengah pijakan kaki
+        let balanceX = centerFeetX - pelvis.x;
+        pelvis.oldX -= balanceX * 0.05; 
+
+        // 2. POSTUR: Tarik Kepala agar selalu di atas panggul (agar tegak)
+        let postureX = pelvis.x - head.x;
+        head.oldX -= postureX * 0.05;
+
+        // 3. POSTUR: Anti-Gravity Kepala (Berusaha berdiri tegak sejauh 110px dari tanah)
+        let idealHeadY = groundY - 110;
+        if (head.y > idealHeadY) {
+            head.oldY += 0.5; // Melawan gravitasi (menarik diri ke atas)
+            neck.oldY += 0.5;
+        }
+
+        // --- KONTROL PEMAIN ---
+        let walkSpeed = 1.2;
+        let isWalking = false;
+        let time = Date.now() / 150; // Waktu untuk animasi gelombang (sine wave) kaki
+
+        if (keys.ArrowRight) {
+            pelvis.oldX -= walkSpeed; // Dorong badan ke kanan
+            head.oldX -= walkSpeed;
+            isWalking = true;
+            // Animasi kaki melangkah
+            leftFoot.oldX -= Math.cos(time) * 3;
+            leftFoot.oldY += Math.sin(time) * 2;
+            rightFoot.oldX -= Math.cos(time + Math.PI) * 3;
+            rightFoot.oldY += Math.sin(time + Math.PI) * 2;
+        }
+        
+        if (keys.ArrowLeft) {
+            pelvis.oldX += walkSpeed;
+            head.oldX += walkSpeed;
+            isWalking = true;
+            leftFoot.oldX += Math.cos(time) * 3;
+            leftFoot.oldY += Math.sin(time) * 2;
+            rightFoot.oldX += Math.cos(time + Math.PI) * 3;
+            rightFoot.oldY += Math.sin(time + Math.PI) * 2;
+        }
+
+        if (keys.ArrowUp) {
+            // Cek apakah minimal satu kaki menyentuh tanah
+            let onGround = leftFoot.y >= groundY - 10 || rightFoot.y >= groundY - 10;
+            if (onGround) {
+                let jumpForce = 15;
+                pelvis.oldY = pelvis.y + jumpForce;
+                neck.oldY = neck.y + jumpForce;
+                head.oldY = head.y + jumpForce;
+            }
+        }
+    }
+
+    function render() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // Gambar Lantai
+        ctx.fillStyle = "#34495e";
+        ctx.fillRect(0, groundY, canvas.width, canvas.height - groundY);
+
+        // Gambar Tulang
+        ctx.beginPath();
+        for (let s of sticks) {
+            ctx.moveTo(s.p0.x, s.p0.y);
+            ctx.lineTo(s.p1.x, s.p1.y);
+        }
+        ctx.strokeStyle = "#2c3e50";
+        ctx.lineWidth = 6;
+        ctx.lineCap = "round";
+        ctx.stroke();
+
+        // Gambar Helm Gladiator (Interchangeable Head)
+        drawGladiatorHelmet(head, neck);
+    }
+
+    function drawGladiatorHelmet(headObj, neckObj) {
+        ctx.save();
+        ctx.translate(headObj.x, headObj.y);
+        
+        // Rotasi kepala mengikuti kemiringan leher
+        let angle = Math.atan2(headObj.y - neckObj.y, headObj.x - neckObj.x) + Math.PI/2;
+        ctx.rotate(angle);
+
+        // Base Kepala
+        ctx.beginPath();
+        ctx.arc(0, 0, headObj.radius, 0, Math.PI * 2);
+        ctx.fillStyle = "#f1c40f"; // Warna Emas Gladiator
+        ctx.fill();
+        ctx.stroke();
+
+        // Jambul Gladiator (Merah)
+        ctx.fillStyle = "#e74c3c";
+        ctx.fillRect(-5, -22, 10, 10);
+        ctx.beginPath();
+        ctx.arc(0, -22, 8, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Pelindung Pipi
+        ctx.fillStyle = "#d35400";
+        ctx.fillRect(-12, -2, 4, 12);
+        ctx.fillRect(8, -2, 4, 12);
+
+        // Mata (Arah Pandang Acak karena wobbly)
+        ctx.fillStyle = "#000";
+        ctx.fillRect(-6, -4, 3, 3);
+        ctx.fillRect(3, -4, 3, 3);
+
+        ctx.restore();
+    }
+
+    // Interaksi Mouse (Drag & Drop)
+    let selectedPoint = null;
+    canvas.addEventListener('mousedown', e => {
+        let mouseX = e.offsetX, mouseY = e.offsetY;
+        for (let p of points) {
+            if (Math.hypot(p.x - mouseX, p.y - mouseY) < 20) {
+                selectedPoint = p;
+                break;
+            }
+        }
+    });
+    canvas.addEventListener('mousemove', e => {
+        if (selectedPoint) {
+            selectedPoint.x = e.offsetX;
+            selectedPoint.y = e.offsetY;
+            selectedPoint.oldX = e.offsetX;
+            selectedPoint.oldY = e.offsetY;
+        }
+    });
+    canvas.addEventListener('mouseup', () => selectedPoint = null);
+    canvas.addEventListener('mouseleave', () => selectedPoint = null);
+
+    // Main Loop
+    function loop() {
+        updatePoints();
+        applyActiveRagdollLogic(); // Postur dan Kontrol dihitung setelah posisi tapi sebelum tulang diikat
+        updateSticks();
+        render();
+        requestAnimationFrame(loop);
+    }
+
+    // Inisialisasi
+    createStickman(canvas.width / 2, canvas.height / 2);
+    loop();
+
+</script>
+</body>
+</html>
